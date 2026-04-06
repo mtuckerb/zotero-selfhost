@@ -764,7 +764,7 @@ in {
 
       services.mysql = {
         enable = true;
-        package = cfg.infrastructure.mysqlPackage;
+        package = mkDefault cfg.infrastructure.mysqlPackage;
         ensureUsers = [
           {
             name = cfg.mysql.user;
