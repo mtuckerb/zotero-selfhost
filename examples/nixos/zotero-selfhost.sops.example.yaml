@@ -1,0 +1,17 @@
+zotero-selfhost:
+  auth-salt: ENC[AES256_GCM,data:replace-with-random-auth-salt,iv:example,tag:example,type:str]
+  superuser-password: ENC[AES256_GCM,data:replace-with-admin-password,iv:example,tag:example,type:str]
+  mysql-password: ENC[AES256_GCM,data:replace-with-mysql-password,iv:example,tag:example,type:str]
+  s3-access-key: ENC[AES256_GCM,data:replace-with-minio-access-key,iv:example,tag:example,type:str]
+  s3-secret-key: ENC[AES256_GCM,data:replace-with-minio-secret-key,iv:example,tag:example,type:str]
+  attachment-proxy-secret: ENC[AES256_GCM,data:replace-with-random-attachment-secret,iv:example,tag:example,type:str]
+sops:
+  age:
+    - recipient: age1replacewithyourpublickeyxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+      enc: |
+        -----BEGIN AGE ENCRYPTED FILE-----
+        REPLACE-THIS-WITH-SOPS-OUTPUT
+        -----END AGE ENCRYPTED FILE-----
+  lastmodified: "2026-04-05T00:00:00Z"
+  mac: ENC[AES256_GCM,data:replace,iv:replace,tag:replace,type:str]
+  version: 3.9.0

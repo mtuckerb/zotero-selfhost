@@ -137,6 +137,12 @@ It also installs helper commands into the system profile:
 
 Legacy plaintext secret options are still present only as hidden compatibility placeholders and now assert if used. Configure secrets via SOPS instead.
 
+For a concrete deployment example, see:
+
+- `docs/nixos-deployment.md`
+- `examples/nixos/zotero-selfhost-host.nix`
+- `examples/nixos/zotero-selfhost.sops.example.yaml`
+
 *Available endpoints*:
 
 | Name          | URL                                           |
