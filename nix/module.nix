@@ -403,8 +403,8 @@ in {
       default = pkgs.fetchFromGitHub {
         owner = "zotero";
         repo = "dataserver";
-        rev = "3190eb141fce890b4a83b59fb56c20cc09b6b149";
-        sha256 = "046c7bj2aq30cnrwywp9fsqqqdr5065k27jqik58hcx0sh5j4y29";
+        rev = "4ce766d98c8f222a0ee41cdfac26d2c18cc26078";
+        sha256 = "092wghpy4227zxn7hzbd5zw80rxw8nlbjl5axlf93fr1dh4zrbw3";
       };
       description = "Path to the Zotero dataserver source tree.";
     };
