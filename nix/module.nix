@@ -284,7 +284,8 @@ let
         printf '%s' "$1" | ${pkgs.perl}/bin/perl -pe 's/\x27/\x27\x27/g'
       }
 
-      export MYSQL_PWD="$(read_secret ${escapeShellArg (secretPath secretKeys.mysqlPassword)})"
+      MYSQL_PWD="$(read_secret ${escapeShellArg (secretPath secretKeys.mysqlPassword)})"
+      export MYSQL_PWD
       MYSQL_HOST=${lib.escapeShellArg cfg.mysql.host}
       MYSQL_PORT=${toString cfg.mysql.port}
       MYSQL_USER=${lib.escapeShellArg cfg.mysql.user}
@@ -365,7 +366,8 @@ let
         printf '%s' "$1" | ${pkgs.perl}/bin/perl -pe 's/\x27/\x27\x27/g'
       }
 
-      export MYSQL_PWD="$(read_secret ${escapeShellArg (secretPath secretKeys.mysqlPassword)})"
+      MYSQL_PWD="$(read_secret ${escapeShellArg (secretPath secretKeys.mysqlPassword)})"
+      export MYSQL_PWD
       MYSQL_HOST=${lib.escapeShellArg cfg.mysql.host}
       MYSQL_PORT=${toString cfg.mysql.port}
       MYSQL_USER=${lib.escapeShellArg cfg.mysql.user}
