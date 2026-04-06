@@ -71,6 +71,72 @@ $ ./bin/init.sh  //run after docker-compose up
 $ cd ..
 ```
 
+### NixOS module
+
+This repository now exposes a NixOS module at `nixosModules.default` and `nixosModules.zotero-selfhost`.
+It packages the upstream dataserver, stream-server, and tinymce-clean-server as systemd services.
+
+Basic flake usage:
+
+```nix
+{
+  inputs = {
+    zotero-selfhost.url = "github:foxsen/zotero-selfhost";
+  };
+
+  outputs = { self, nixpkgs, zotero-selfhost, ... }: {
+    nixosConfigurations.my-host = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        zotero-selfhost.nixosModules.default
+        ({ ... }: {
+          system.stateVersion = "25.05";
+
+          services.zotero-selfhost = {
+            enable = true;
+            sopsFile = /run/secrets/zotero-selfhost.yaml;
+            baseUri = "https://zotero.example.com";
+            attachmentProxyUrl = "https://files.example.com/";
+            mysql.host = "127.0.0.1";
+            redisHost = "127.0.0.1";
+            memcachedHost = "127.0.0.1";
+            elasticsearchHost = "127.0.0.1";
+            s3.endpoint = "minio.internal:9000";
+            s3.endpointUrl = "http://minio.internal:9000";
+            s3.createBuckets = true;
+          };
+        })
+      ];
+    };
+  };
+}
+```
+
+Required SOPS keys under the default `secretPrefix = "zotero-selfhost"`:
+
+- `zotero-selfhost/auth-salt`
+- `zotero-selfhost/superuser-password`
+- `zotero-selfhost/mysql-password`
+- `zotero-selfhost/s3-access-key`
+- `zotero-selfhost/s3-secret-key`
+- `zotero-selfhost/attachment-proxy-secret`
+
+The module creates these services:
+
+- `zotero-selfhost`
+- `zotero-selfhost-stream`
+- `zotero-selfhost-tinymce`
+
+It also installs helper commands into the system profile:
+
+- `zotero-selfhost-init`
+- `zotero-selfhost-create-user`
+
+`zotero-selfhost-init` bootstraps the databases and optional S3 buckets.
+`zotero-selfhost-create-user UID username password email` adds additional users.
+
+Legacy plaintext secret options are still present only as hidden compatibility placeholders and now assert if used. Configure secrets via SOPS instead.
+
 *Available endpoints*:
 
 | Name          | URL                                           |
