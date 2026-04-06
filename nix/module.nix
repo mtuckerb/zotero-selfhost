@@ -400,20 +400,35 @@ in {
 
     dataserverSrc = mkOption {
       type = types.path;
-      default = ../src/server/dataserver;
-      description = "Path to the Zotero dataserver checkout.";
+      default = pkgs.fetchFromGitHub {
+        owner = "zotero";
+        repo = "dataserver";
+        rev = "3190eb141fce890b4a83b59fb56c20cc09b6b149";
+        sha256 = "046c7bj2aq30cnrwywp9fsqqqdr5065k27jqik58hcx0sh5j4y29";
+      };
+      description = "Path to the Zotero dataserver source tree.";
     };
 
     streamServerSrc = mkOption {
       type = types.path;
-      default = ../src/server/stream-server;
-      description = "Path to the Zotero stream-server checkout.";
+      default = pkgs.fetchFromGitHub {
+        owner = "zotero";
+        repo = "stream-server";
+        rev = "7e2e57d49ad300dd595ab9e239afe908525097b4";
+        sha256 = "1ip5ljcywxk38c1n3g25qilvwvxh56aif0a1sc8w04hdiz1w2fib";
+      };
+      description = "Path to the Zotero stream-server source tree.";
     };
 
     tinymceCleanServerSrc = mkOption {
       type = types.path;
-      default = ../src/server/tinymce-clean-server;
-      description = "Path to the Zotero tinymce-clean-server checkout.";
+      default = pkgs.fetchFromGitHub {
+        owner = "zotero";
+        repo = "tinymce-clean-server";
+        rev = "5be2a0d367133b728872bee9975beed1c9e74898";
+        sha256 = "0hyzr3xnhw5n6ds7z1mvll7kh83pas44jdywvrgi2f7wykmklzhi";
+      };
+      description = "Path to the Zotero TinyMCE clean server source tree.";
     };
 
     wwwSql = mkOption {
