@@ -398,25 +398,25 @@ in {
 
     dataserverSrc = mkOption {
       type = types.path;
-      default = ../../src/server/dataserver;
+      default = ../src/server/dataserver;
       description = "Path to the Zotero dataserver checkout.";
     };
 
     streamServerSrc = mkOption {
       type = types.path;
-      default = ../../src/server/stream-server;
+      default = ../src/server/stream-server;
       description = "Path to the Zotero stream-server checkout.";
     };
 
     tinymceCleanServerSrc = mkOption {
       type = types.path;
-      default = ../../src/server/tinymce-clean-server;
+      default = ../src/server/tinymce-clean-server;
       description = "Path to the Zotero tinymce-clean-server checkout.";
     };
 
     wwwSql = mkOption {
       type = types.path;
-      default = ../../config/dataserver-scripts/www.sql;
+      default = ../config/dataserver-scripts/www.sql;
       description = "Path to the www.sql bootstrap schema file.";
     };
 
