@@ -4,7 +4,7 @@ let
   cfg = config.services.zotero-selfhost;
   inherit (lib) mkDefault mkEnableOption mkIf mkMerge mkOption optionalString types escapeShellArg nameValuePair mapAttrs';
 
-  php = pkgs.php82.buildEnv {
+  php = pkgs.php84.buildEnv {
     extensions = ({ enabled, all }: enabled ++ (with all; [ curl intl mbstring mysqli redis memcached ]));
     extraConfig = ''
       memory_limit = 1G
@@ -59,7 +59,7 @@ let
     pname = "zotero-selfhost-dataserver";
     version = "git";
     src = cfg.dataserverSrc;
-    nativeBuildInputs = [ pkgs.php82Packages.composer pkgs.rsync ];
+    nativeBuildInputs = [ pkgs.php84Packages.composer pkgs.rsync ];
     dontBuild = true;
     installPhase = ''
       runHook preInstall
