@@ -19,7 +19,7 @@ let
     pname = "zotero-stream-server-node-deps";
     version = "git";
     src = cfg.streamServerSrc;
-    nativeBuildInputs = [ pkgs.nodejs pkgs.nodePackages.npm pkgs.cacert ];
+    nativeBuildInputs = [ pkgs.nodejs pkgs.nodejs pkgs.cacert ];
     dontBuild = true;
     dontFixup = true;
     installPhase = ''
@@ -57,7 +57,7 @@ let
     pname = "zotero-tinymce-clean-server-node-deps";
     version = "git";
     src = cfg.tinymceCleanServerSrc;
-    nativeBuildInputs = [ pkgs.nodejs pkgs.nodePackages.npm pkgs.cacert ];
+    nativeBuildInputs = [ pkgs.nodejs pkgs.nodejs pkgs.cacert ];
     dontBuild = true;
     dontFixup = true;
     installPhase = ''
