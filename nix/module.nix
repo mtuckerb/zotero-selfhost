@@ -358,9 +358,12 @@ let
       mysql_base ${cfg.mysql.idsDb} < "$misc/ids.sql"
 
       ${optionalString (cfg.s3.createBuckets && cfg.s3.endpointUrl != null) ''
-        export AWS_ACCESS_KEY_ID="$(read_secret ${escapeShellArg (secretPath secretKeys.s3AccessKey)})"
-        export AWS_SECRET_ACCESS_KEY="$(read_secret ${escapeShellArg (secretPath secretKeys.s3SecretKey)})"
-        export AWS_DEFAULT_REGION=${lib.escapeShellArg cfg.s3.region}
+        AWS_ACCESS_KEY_ID="$(read_secret ${escapeShellArg (secretPath secretKeys.s3AccessKey)})"
+        export AWS_ACCESS_KEY_ID
+        AWS_SECRET_ACCESS_KEY="$(read_secret ${escapeShellArg (secretPath secretKeys.s3SecretKey)})"
+        export AWS_SECRET_ACCESS_KEY
+        AWS_DEFAULT_REGION=${lib.escapeShellArg cfg.s3.region}
+        export AWS_DEFAULT_REGION
         aws --endpoint-url ${lib.escapeShellArg cfg.s3.endpointUrl} s3 mb s3://${cfg.s3.bucket} || true
         aws --endpoint-url ${lib.escapeShellArg cfg.s3.endpointUrl} s3 mb s3://${cfg.s3.fulltextBucket} || true
       ''}
