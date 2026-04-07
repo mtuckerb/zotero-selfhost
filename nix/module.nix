@@ -15,11 +15,29 @@ let
     '';
   };
 
+  streamServerNodeDeps = pkgs.stdenvNoCC.mkDerivation {
+    pname = "zotero-stream-server-node-deps";
+    version = "git";
+    src = cfg.streamServerSrc;
+    nativeBuildInputs = [ pkgs.nodejs pkgs.nodePackages.npm pkgs.cacert ];
+    dontBuild = true;
+    dontFixup = true;
+    installPhase = ''
+      export HOME=$TMPDIR
+      export npm_config_cache=$TMPDIR/npm-cache
+      npm ci --omit=dev
+      cp -r node_modules $out
+    '';
+    outputHashAlgo = "sha256";
+    outputHashMode = "recursive";
+    outputHash = cfg.streamServerNodeDepsHash;
+  };
+
   streamServerPkg = pkgs.stdenvNoCC.mkDerivation {
     pname = "zotero-selfhost-stream-server";
     version = "git";
     src = cfg.streamServerSrc;
-    nativeBuildInputs = [ pkgs.makeWrapper pkgs.nodejs pkgs.npm ];
+    nativeBuildInputs = [ pkgs.makeWrapper pkgs.nodejs ];
     dontBuild = true;
     installPhase = ''
       runHook preInstall
@@ -27,7 +45,7 @@ let
       cp -R . $out/libexec/stream-server/
       chmod -R u+w $out/libexec/stream-server
       rm -rf $out/libexec/stream-server/node_modules
-      HOME=$TMPDIR npm_config_cache=$TMPDIR/npm-cache npm ci --omit=dev --prefix $out/libexec/stream-server
+      cp -r ${streamServerNodeDeps} $out/libexec/stream-server/node_modules
       makeWrapper ${pkgs.nodejs}/bin/node $out/bin/zotero-stream-server \
         --chdir $out/libexec/stream-server \
         --add-flags index.js
@@ -35,11 +53,29 @@ let
     '';
   };
 
+  tinymceNodeDeps = pkgs.stdenvNoCC.mkDerivation {
+    pname = "zotero-tinymce-clean-server-node-deps";
+    version = "git";
+    src = cfg.tinymceCleanServerSrc;
+    nativeBuildInputs = [ pkgs.nodejs pkgs.nodePackages.npm pkgs.cacert ];
+    dontBuild = true;
+    dontFixup = true;
+    installPhase = ''
+      export HOME=$TMPDIR
+      export npm_config_cache=$TMPDIR/npm-cache
+      npm install --omit=dev
+      cp -r node_modules $out
+    '';
+    outputHashAlgo = "sha256";
+    outputHashMode = "recursive";
+    outputHash = cfg.tinymceNodeDepsHash;
+  };
+
   tinymceCleanServerPkg = pkgs.stdenvNoCC.mkDerivation {
     pname = "zotero-selfhost-tinymce-clean-server";
     version = "git";
     src = cfg.tinymceCleanServerSrc;
-    nativeBuildInputs = [ pkgs.makeWrapper pkgs.nodejs pkgs.npm ];
+    nativeBuildInputs = [ pkgs.makeWrapper pkgs.nodejs ];
     dontBuild = true;
     installPhase = ''
       runHook preInstall
@@ -47,7 +83,7 @@ let
       cp -R . $out/libexec/tinymce-clean-server/
       chmod -R u+w $out/libexec/tinymce-clean-server
       rm -rf $out/libexec/tinymce-clean-server/node_modules
-      HOME=$TMPDIR npm_config_cache=$TMPDIR/npm-cache npm install --omit=dev --prefix $out/libexec/tinymce-clean-server
+      cp -r ${tinymceNodeDeps} $out/libexec/tinymce-clean-server/node_modules
       makeWrapper ${pkgs.nodejs}/bin/node $out/bin/zotero-tinymce-clean-server \
         --chdir $out/libexec/tinymce-clean-server \
         --add-flags server.js
@@ -439,7 +475,19 @@ in {
     composerVendorHash = mkOption {
       type = types.str;
       default = "sha256-ranFTRff1xLMrsgdw6jZLCUKv8MUSpI2ttEFiuqmcbE=";
-      description = "SRI hash of the pre-fetched Composer vendor directory for the dataserver. Set to lib.fakeHash and build once to obtain the correct value.";
+      description = "SRI hash of the pre-fetched Composer vendor directory for the dataserver.";
+    };
+
+    streamServerNodeDepsHash = mkOption {
+      type = types.str;
+      default = "sha256-B0dIHRdxvANv3Q7LHgNHpFDAcxKDxUznEpkyt0s31ak=";
+      description = "SRI hash of the pre-fetched node_modules for the stream server.";
+    };
+
+    tinymceNodeDepsHash = mkOption {
+      type = types.str;
+      default = "sha256-9sgdwd9AJZYi5eLu+0Ca+oqG+MwGEkJO+xIfIekmLLw=";
+      description = "SRI hash of the pre-fetched node_modules for the TinyMCE clean server.";
     };
 
     streamServerSrc = mkOption {
