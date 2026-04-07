@@ -55,22 +55,46 @@ let
     '';
   };
 
+  composerVendor = pkgs.stdenvNoCC.mkDerivation {
+    pname = "zotero-dataserver-composer-deps";
+    version = "git";
+    src = cfg.dataserverSrc;
+    nativeBuildInputs = [ php pkgs.php84Packages.composer pkgs.cacert ];
+    dontBuild = true;
+    dontFixup = true;
+    installPhase = ''
+      export HOME=$TMPDIR
+      export COMPOSER_HOME=$TMPDIR/composer
+      export COMPOSER_CACHE_DIR=$TMPDIR/composer-cache
+      composer install --no-dev --no-interaction --no-progress --prefer-dist
+      cp -r vendor $out
+    '';
+    outputHashAlgo = "sha256";
+    outputHashMode = "recursive";
+    outputHash = cfg.composerVendorHash;
+  };
+
   dataserverPkg = pkgs.stdenvNoCC.mkDerivation {
     pname = "zotero-selfhost-dataserver";
     version = "git";
     src = cfg.dataserverSrc;
-    nativeBuildInputs = [ pkgs.php84Packages.composer pkgs.rsync ];
+    nativeBuildInputs = [ php pkgs.php84Packages.composer pkgs.rsync ];
     dontBuild = true;
+    # The upstream dataserver repo has a dangling symlink (htdocs/schema -> zotero-schema/schema.json)
+    # because zotero-schema is a git submodule not included in the GitHub tarball.
+    dontCheckForBrokenSymlinks = true;
     installPhase = ''
       runHook preInstall
       mkdir -p $out/share/zotero-dataserver
       rsync -a --exclude .git --exclude tests --exclude tmp --exclude vendor ./ $out/share/zotero-dataserver/
       chmod -R u+w $out/share/zotero-dataserver
+      cp -r ${composerVendor} $out/share/zotero-dataserver/vendor
+      chmod -R u+w $out/share/zotero-dataserver/vendor
       export HOME=$TMPDIR
       export COMPOSER_HOME=$TMPDIR/composer
       export COMPOSER_CACHE_DIR=$TMPDIR/composer-cache
       cd $out/share/zotero-dataserver
-      composer install --no-dev --no-interaction --no-progress --optimize-autoloader
+      composer dump-autoload --no-dev --optimize
       runHook postInstall
     '';
   };
@@ -407,6 +431,12 @@ in {
         sha256 = "092wghpy4227zxn7hzbd5zw80rxw8nlbjl5axlf93fr1dh4zrbw3";
       };
       description = "Path to the Zotero dataserver source tree.";
+    };
+
+    composerVendorHash = mkOption {
+      type = types.str;
+      default = "sha256-ranFTRff1xLMrsgdw6jZLCUKv8MUSpI2ttEFiuqmcbE=";
+      description = "SRI hash of the pre-fetched Composer vendor directory for the dataserver. Set to lib.fakeHash and build once to obtain the correct value.";
     };
 
     streamServerSrc = mkOption {
