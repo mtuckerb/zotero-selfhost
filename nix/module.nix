@@ -1085,6 +1085,25 @@ in {
         default = 9001;
         description = "Loopback console port for the integrated MinIO service.";
       };
+
+      minio = {
+        enable = mkOption {
+          type = types.bool;
+          default = true;
+          description = ''
+            Whether to provision the bundled MinIO instance as part of the
+            integrated infrastructure stack. Set to false when you already
+            have an S3-compatible backend (e.g. another minio, AWS S3, R2,
+            B2) and want the dataserver to use it instead. When disabled,
+            you must explicitly set `services.zotero-selfhost.s3.endpointUrl`
+            and provide credentials in the sops file matching whatever
+            backend you're pointing at. The dataserver will not wait for
+            `zotero-selfhost-minio.service` at startup, and the integrated
+            nginx attachments vhost will reverse-proxy to whatever
+            `s3.endpointUrl` resolves to.
+          '';
+        };
+      };
     };
 
     webLibrary = {
@@ -1273,13 +1292,12 @@ in {
         "zotero-selfhost-stream.service"
         "zotero-selfhost-tinymce.service"
       ]
-      ++ lib.optionals cfg.infrastructure.enable [
+      ++ lib.optionals cfg.infrastructure.enable ([
         "mysql.service"
         "redis-zotero-selfhost.service"
         "memcached.service"
         "opensearch.service"
-        "zotero-selfhost-minio.service"
-      ];
+      ] ++ lib.optional cfg.infrastructure.minio.enable "zotero-selfhost-minio.service");
       wants = [ "network-online.target" ];
       serviceConfig = {
         Type = "simple";
@@ -1377,7 +1395,7 @@ in {
         };
       };
 
-      systemd.services.zotero-selfhost-minio = {
+      systemd.services.zotero-selfhost-minio = lib.mkIf cfg.infrastructure.minio.enable {
         description = "Zotero Selfhost MinIO object storage";
         wantedBy = [ "multi-user.target" ];
         # Must wait for sops-install-secrets to decrypt the s3 access/secret
@@ -1478,7 +1496,14 @@ in {
           enableACME = cfg.infrastructure.enableACME;
           forceSSL = cfg.infrastructure.forceSSL;
           locations."/" = {
-            proxyPass = "http://127.0.0.1:${toString cfg.infrastructure.minioPort}";
+            # When the bundled minio is disabled, follow whatever endpointUrl
+            # the operator configured (existing minio, AWS S3, R2, etc).
+            # Otherwise short-circuit to the loopback bundled instance to
+            # avoid the host vs. cfg.s3.endpointUrl drift.
+            proxyPass =
+              if cfg.infrastructure.minio.enable
+              then "http://127.0.0.1:${toString cfg.infrastructure.minioPort}"
+              else cfg.s3.endpointUrl;
           };
         };
       };
