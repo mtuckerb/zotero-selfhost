@@ -149,6 +149,7 @@ let
     ../src/patches/dataserver/0002-config-aws-for-local-minio-server.patch
     ../src/patches/dataserver/0005-presigned-s3-urls-for-downloads.patch
     ../src/patches/dataserver/0006-remove-storage-quota.patch
+    ../src/patches/dataserver/0007-bump-upload-queue-limit.patch
   ];
 
   composerVendor = pkgs.stdenvNoCC.mkDerivation {

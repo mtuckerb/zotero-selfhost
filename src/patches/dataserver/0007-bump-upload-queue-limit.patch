@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000007 Mon Sep 17 00:00:00 2001
+From: NixOS module overlay <noreply@example.com>
+Date: Wed, 8 Apr 2026 00:00:00 +0000
+Subject: [PATCH 7/7] Raise the per-user upload queue limit for self-hosted
+
+Upstream zotero/dataserver caps each user to 10 in-flight upload URL
+requests in any 5-minute window:
+
+    public static $uploadQueueLimit = 10;
+    public static $uploadQueueTimeout = 300;
+
+When the limit is exceeded the dataserver responds with HTTP 413 and
+the desktop client surfaces it as a generic "file sync error" — exactly
+the same UI as the storage-quota and attachment-body-size walls, with
+no useful diagnostics distinguishing it from any other failure.
+
+This is fine on hosted zotero.org where it's a per-account anti-abuse
+limit on a multi-tenant system, but it's the wrong default for a
+self-hosted single-user (or small-team) deployment, where the only
+client is *your* client and a single Restore-to-Online migration of an
+established library will routinely queue dozens of uploads in a single
+batch. Each previous failure (e.g. quota wall, body-size wall) leaves
+its row in storageUploadQueue for 5 full minutes, so even after fixing
+the underlying problem the queue stays "full" and every retry gets
+413'd until the row ages out.
+
+Bump the limit to 200. Still bounded — a runaway client can't DoS the
+server — but high enough that no realistic single-user workload will
+ever notice. The 300-second timeout is left untouched so genuinely
+stale entries still age out.
+---
+diff --git a/model/Storage.inc.php b/model/Storage.inc.php
+index 1234567..89abcde 100644
+--- a/model/Storage.inc.php
++++ b/model/Storage.inc.php
+@@ -26,7 +26,9 @@
+ 	// Self-hosted: default to effectively unlimited (10 TB in MB).
+ 	// Per-user overrides via storageAccounts still work as before.
+ 	public static $defaultQuota = 10485760;
+-	public static $uploadQueueLimit = 10;
++	// Self-hosted: raise the per-user in-flight upload queue limit
++	// from the zotero.org abuse-prevention default of 10 to 200.
++	public static $uploadQueueLimit = 200;
+ 	public static $uploadQueueTimeout = 300;
+ 	private static $s3PresignedRequestTTL = 3600;
+
