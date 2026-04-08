@@ -254,6 +254,101 @@ let
     '';
   };
 
+  # zotero/web-library SPA build. Wrapped as a fixed-output derivation
+  # because the build needs network at multiple stages: npm install for
+  # dependencies, build:locale and build:styles-json for fetching CSL
+  # styles and locale strings from the internet, etc. The whole build
+  # output is hashed via outputHash for reproducibility.
+  #
+  # Source patches applied via sed in the build script:
+  # - src/js/constants/defaults.js: rewrite api.zotero.org → cfg.webLibrary.hostname
+  # - src/js/utils.js: rewrite item canonical URL + parser regex
+  # - src/html/index.html: replace the demo zotero-web-library-config
+  #   block with our userId/userSlug/apiKey, and the menu config with a
+  #   single My Library entry
+  # - scripts/task-runner.mjs: wrap setRawMode in isTTY guards (so the
+  #   interactive task picker doesn't crash when stdin isn't a TTY,
+  #   which is the case in the nix build sandbox)
+  # - scripts/build.mjs: replace `cp -aL` with `cp -arL` (uutils-coreutils
+  #   on NixOS doesn't accept GNU's `-a` shorthand for `-rL`)
+  webLibraryPkg = pkgs.stdenvNoCC.mkDerivation {
+    pname = "zotero-web-library";
+    version = "git";
+    src = cfg.webLibrarySrc;
+    nativeBuildInputs = [ pkgs.nodejs_20 pkgs.cacert pkgs.gnused ];
+    dontBuild = true;
+    dontFixup = true;
+    installPhase = ''
+      runHook preInstall
+      export HOME=$TMPDIR
+      export npm_config_cache=$TMPDIR/npm-cache
+
+      # Build script patches (uutils-coreutils + non-TTY stdin)
+      ${pkgs.gnused}/bin/sed -i 's|cp -aL|cp -arL|g' scripts/build.mjs
+      ${pkgs.gnused}/bin/sed -i \
+        -e 's|process.stdin.setRawMode(true);|if (process.stdin.isTTY) process.stdin.setRawMode(true);|' \
+        -e 's|process.stdin.setRawMode(false);|if (process.stdin.isTTY) process.stdin.setRawMode(false);|' \
+        scripts/task-runner.mjs
+
+      # Source patches: URLs and item canonical regex
+      ${pkgs.gnused}/bin/sed -i \
+        -e "s|apiAuthorityPart: 'api.zotero.org'|apiAuthorityPart: '${cfg.webLibrary.hostname}'|" \
+        -e "s|export const websiteUrl = 'https://www.zotero.org/'|export const websiteUrl = 'https://${cfg.webLibrary.hostname}/'|" \
+        -e "s|export const streamingApiUrl = 'wss://stream.zotero.org/'|export const streamingApiUrl = 'wss://${cfg.webLibrary.hostname}/stream/'|" \
+        src/js/constants/defaults.js
+
+      ${pkgs.gnused}/bin/sed -i \
+        -e "s|http://zotero.org/|https://${cfg.webLibrary.hostname}/|g" \
+        -e "s|https?://zotero.org/|https?://(?:zotero\\\\.org\\|${pkgs.lib.replaceStrings ["."] ["\\\\."] cfg.webLibrary.hostname})/|g" \
+        src/js/utils.js
+
+      # Inject the user's config + minimal menu into the demo index.html.
+      # We use a python helper because the upstream block has multiline
+      # JSON that's awkward to match with sed. The python is bundled
+      # with the nix store nodejs build deps already.
+      ${pkgs.python3}/bin/python3 -c "$(cat <<PYEOF
+import re, sys
+src = open('src/html/index.html').read()
+new_config = '''<script type="application/json" id="zotero-web-library-config">
+\t\t{
+\t\t\t"userSlug": "${cfg.webLibrary.userSlug}",
+\t\t\t"userId": "${cfg.webLibrary.userId}",
+\t\t\t"apiKey": "${cfg.webLibrary.apiKey}"
+\t\t}
+\t</script>'''
+src = re.sub(
+    r'<script type="application/json" id="zotero-web-library-config">.*?</script>',
+    lambda m: new_config,
+    src, count=1, flags=re.DOTALL,
+)
+new_menu = '''<script type="application/json" id="zotero-web-library-menu-config">
+\t\t{
+\t\t\t"desktop": [{ "label": "My Library", "href": "/${cfg.webLibrary.userSlug}/library", "active": true }],
+\t\t\t"mobile":  [{ "label": "My Library", "href": "/${cfg.webLibrary.userSlug}/library", "active": true }]
+\t\t}
+\t</script>'''
+src = re.sub(
+    r'<script type="application/json" id="zotero-web-library-menu-config">.*?</script>',
+    lambda m: new_menu,
+    src, count=1, flags=re.DOTALL,
+)
+open('src/html/index.html', 'w').write(src)
+PYEOF
+)"
+
+      # Install + build
+      npm install --no-audit --no-fund --legacy-peer-deps
+      npm run build
+
+      mkdir -p $out
+      cp -r build/* $out/
+      runHook postInstall
+    '';
+    outputHashAlgo = "sha256";
+    outputHashMode = "recursive";
+    outputHash = cfg.webLibraryHash;
+  };
+
   dataDir = cfg.stateDir;
   runtimeDir = "${cfg.stateDir}/runtime";
   dataserverRuntime = "${runtimeDir}/dataserver";
@@ -685,6 +780,39 @@ in {
       '';
     };
 
+    webLibrarySrc = mkOption {
+      type = types.path;
+      default = pkgs.fetchgit {
+        url = "https://github.com/zotero/web-library.git";
+        rev = "1b08825422996b3ee5480a372577b90d2b0e8e71";  # v1.7.5
+        sha256 = "sha256-829dDg5dgwCO6GVFyIaZKhRExaq593sNJmNi76DkOzw=";
+        fetchSubmodules = true;
+      };
+      description = ''
+        Path to the zotero/web-library source tree (with submodules).
+        zotero/web-library has 6 git submodules (reader, pdf-worker,
+        note-editor, web-common, zotero-schema, locales) which are
+        required at build time. Use pkgs.fetchgit { fetchSubmodules =
+        true; ... } to fetch them — pkgs.fetchFromGitHub does not
+        currently support fetchSubmodules in nixos-25.05.
+      '';
+    };
+
+    webLibraryHash = mkOption {
+      type = types.str;
+      default = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+      description = ''
+        SRI hash of the built web-library bundle (the result of
+        `npm install && npm run build`). The build is wrapped as a
+        fixed-output derivation because it needs network access at
+        build time (npm registry, fonts, citation styles, locales).
+        When you bump webLibrarySrc or change a webLibrary option that
+        affects the build, set this to lib.fakeHash temporarily,
+        rebuild to discover the real hash from the "got:" line in the
+        error, and set it here.
+      '';
+    };
+
     wwwSql = mkOption {
       type = types.path;
       default = ../config/dataserver-scripts/www.sql;
@@ -894,6 +1022,84 @@ in {
         type = types.port;
         default = 9001;
         description = "Loopback console port for the integrated MinIO service.";
+      };
+    };
+
+    webLibrary = {
+      enable = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Build and serve zotero/web-library at the configured hostname.
+          When enabled, the SPA is served from / on the same vhost as
+          the dataserver API, with the dataserver API paths
+          (/users, /groups, /itemTypes, etc) carved out via a regex
+          location that takes precedence over the SPA root location.
+          The SPA's React Router uses root-relative paths
+          (/<userSlug>/items/<key>/reader, etc), so it MUST be mounted
+          at root — not under a sub-path — or internal navigation will
+          break on refresh.
+        '';
+      };
+
+      hostname = mkOption {
+        type = types.str;
+        default = cfg.infrastructure.hostname;
+        description = "Public hostname to serve the web library SPA on.";
+      };
+
+      apiKey = mkOption {
+        type = types.str;
+        example = "4YG74kzuoCxVsnSBdBrBauul";
+        description = ''
+          Zotero API key baked into the SPA build's index.html config
+          block. The SPA will use this key for all API requests. The
+          key must already exist in zotero_master.keys with library
+          permissions on the user's library; see README "Manual setup
+          steps" → "Create an API key for the web library".
+
+          NOTE: this string is baked into the JS bundle and visible to
+          anyone who can fetch /static/web-library/zotero-web-library.js.
+          Use basicAuthFile to gate access to the bundle, OR put a
+          per-user OAuth proxy in front. For multi-user web access
+          you'd need a separate build per user — the upstream SPA has
+          no runtime apiKey injection.
+        '';
+      };
+
+      userId = mkOption {
+        type = types.str;
+        default = "1";
+        description = "Numeric Zotero user ID for the SPA's default library view.";
+      };
+
+      userSlug = mkOption {
+        type = types.str;
+        default = "admin";
+        description = ''
+          Username slug for the SPA's default library view. Must match
+          the `username` of the corresponding row in zotero_master.users.
+          Don't use a slug that collides with a dataserver API path
+          prefix (users, groups, itemTypes, itemFields, creatorFields,
+          itemTypeFields, itemTypeCreatorTypes, keys, login,
+          storagepurge, test, tts, items, globalitems) — the regex
+          location for the API will swallow the request before it
+          reaches the SPA.
+        '';
+      };
+
+      basicAuthFile = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "/etc/nginx/htpasswd.zotero-library";
+        description = ''
+          Path to an htpasswd file that gates access to the web
+          library SPA paths (/, /static/web-library/). The dataserver
+          API paths stay open so Zotero desktop / mobile clients can
+          still sync via Zotero-API-Key headers. Strongly recommended
+          for any internet-facing deployment because the apiKey is
+          baked into the JS bundle.
+        '';
       };
     };
   };
@@ -1150,17 +1356,62 @@ in {
         # Note: TLS settings are intentionally not set here. They are a host-wide
         # concern; users should configure recommendedTlsSettings themselves if
         # their nginx build supports the required directives.
-        virtualHosts.${cfg.infrastructure.hostname} = {
-          enableACME = cfg.infrastructure.enableACME;
-          forceSSL = cfg.infrastructure.forceSSL;
-          locations."/" = {
-            proxyPass = "http://${cfg.listenAddress}:${toString cfg.listenPort}";
-          };
-          locations."/stream/" = {
-            proxyPass = "http://${cfg.listenAddress}:${toString cfg.streamPort}/";
-            proxyWebsockets = true;
-          };
-        };
+        virtualHosts.${cfg.infrastructure.hostname} = lib.mkMerge [
+          {
+            enableACME = cfg.infrastructure.enableACME;
+            forceSSL = cfg.infrastructure.forceSSL;
+            locations."/" = mkIf (!cfg.webLibrary.enable) {
+              proxyPass = "http://${cfg.listenAddress}:${toString cfg.listenPort}";
+            };
+            locations."/stream/" = {
+              proxyPass = "http://${cfg.listenAddress}:${toString cfg.streamPort}/";
+              proxyWebsockets = true;
+            };
+          }
+          # Web library SPA layout: serve the SPA at root and carve out
+          # explicit dataserver API path prefixes via a regex location
+          # that takes precedence over the SPA root in nginx evaluation
+          # order. The SPA's React Router uses root-relative paths
+          # (/<userSlug>/items/<key>/reader, etc) so it MUST live at
+          # root or internal navigation breaks on refresh. The bundled
+          # apiKey is gated behind basicAuthFile if set.
+          (mkIf cfg.webLibrary.enable {
+            locations = {
+              # Dataserver API — open access (Zotero clients use the
+              # Zotero-API-Key header). Regex prefix takes precedence
+              # over the SPA root location.
+              "~ ^/(users|groups|itemTypes|itemFields|creatorFields|itemTypeFields|itemTypeCreatorTypes|keys|login|storagepurge|test|tts|items|globalitems)(/|$)" = {
+                proxyPass = "http://${cfg.listenAddress}:${toString cfg.listenPort}";
+                extraConfig = ''
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+                '';
+              };
+
+              # SPA static assets — index.html references these as
+              # /static/web-library/... (root-relative).
+              "/static/web-library/" = {
+                alias = "${webLibraryPkg}/static/web-library/";
+              } // (lib.optionalAttrs (cfg.webLibrary.basicAuthFile != null) {
+                basicAuthFile = cfg.webLibrary.basicAuthFile;
+              });
+
+              # SPA root catch-all with try_files fallback to index.html
+              # for client-side routes. mkForce because the upstream
+              # block above sets locations."/" to proxy_pass the
+              # dataserver — when webLibrary.enable is true we replace
+              # it entirely.
+              "/" = lib.mkForce ({
+                root = "${webLibraryPkg}";
+                tryFiles = "$uri $uri/ /index.html";
+              } // (lib.optionalAttrs (cfg.webLibrary.basicAuthFile != null) {
+                basicAuthFile = cfg.webLibrary.basicAuthFile;
+              }));
+            };
+          })
+        ];
         virtualHosts.${cfg.infrastructure.attachmentsHostname} = {
           enableACME = cfg.infrastructure.enableACME;
           forceSSL = cfg.infrastructure.forceSSL;
