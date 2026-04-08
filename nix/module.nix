@@ -169,6 +169,20 @@ let
         's|return "https://" \. Z_CONFIG::\$S3_BUCKET \. "\.s3\.amazonaws\.com/";|return "${cfg.s3.scheme}://" . Z_CONFIG::$S3_ENDPOINT . "/" . Z_CONFIG::$S3_BUCKET . "/";|' \
         $out/share/zotero-dataserver/model/Storage.inc.php
 
+      # Patch 0002 (config-aws-for-local-minio-server) added the AWS SDK
+      # endpoint config but hardcoded `http` for the same localhost-dev
+      # reason patch 0004 did. Substitute the scheme to match
+      # cfg.s3.scheme. Without this, after a successful upload the
+      # dataserver does a HEAD request against the http URL (in
+      # Storage::registerUpload) which gets 403/301'd by the http
+      # listener, and the registration POST returns 500. Symptom: the
+      # web library shows "An error occurred" after the multipart POST
+      # to minio succeeded with HTTP 201.
+      ${pkgs.gnused}/bin/sed -i \
+        -e "s|'endpoint' => 'http://'|'endpoint' => '${cfg.s3.scheme}://'|" \
+        -e "s|'scheme' => 'http'|'scheme' => '${cfg.s3.scheme}'|" \
+        $out/share/zotero-dataserver/include/header.inc.php
+
       # Extract Zend Framework 1 — bundled in this repo at
       # src/patches/dataserver/Zend.tar.gz. The upstream zotero/dataserver
       # expects ZF1 to live in include/Zend/ but ships an empty Zend/
