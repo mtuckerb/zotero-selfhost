@@ -1,0 +1,64 @@
+From 0000000000000000000000000000000000000005 Mon Sep 17 00:00:00 2001
+From: NixOS module overlay <noreply@example.com>
+Date: Wed, 8 Apr 2026 00:00:00 +0000
+Subject: [PATCH 5/5] Use AWS SDK presigned S3 URLs for download URLs
+
+The upstream zotero/dataserver wraps download URLs in a custom HMAC-signed
+format that points at $ATTACHMENT_PROXY_URL, expecting a separate
+"attachment proxy" service to verify the signature, decode the payload,
+and stream the file from S3 / minio. Upstream zotero.org runs that proxy
+as a separate component but doesn't open-source it, and the NixOS module
+doesn't ship a substitute.
+
+For self-hosted deployments where the dataserver talks directly to minio,
+generate AWS SDK V4 presigned GET URLs instead. Minio validates the V4
+signature itself and serves the file directly — no separate proxy needed.
+The legacy custom format is kept as a fallback for the upload-URL code
+path (which uses the same generateSignedURL helper but a different
+field shape) since the working upload flow uses Storage::getUploadFileInfo's
+signed POST policy and never actually relies on this URL.
+---
+diff --git a/model/Attachments.inc.php b/model/Attachments.inc.php
+index 3d2a573..694a3de 100644
+--- a/model/Attachments.inc.php
++++ b/model/Attachments.inc.php
+@@ -124,6 +124,39 @@ class Zotero_Attachments {
+ 	}
+ 	
+ 	public static function generateSignedURL($payload, $filename) {
++		// Self-hosted override: for download URLs (payload contains 'hash'),
++		// generate an AWS SDK V4 presigned GET URL pointing directly at the
++		// configured S3 endpoint. The legacy attachment-proxy format below
++		// requires a separate proxy service that the NixOS deployment doesn't
++		// ship; presigned URLs let minio validate the signature itself.
++		if (isset($payload['hash'])) {
++			try {
++				$hash = $payload['hash'];
++				$contentType = isset($payload['contentType']) ? $payload['contentType'] : 'application/octet-stream';
++				$bucket = Z_CONFIG::$S3_BUCKET;
++				$ttl = isset($payload['expires']) ? max(60, $payload['expires'] - time()) : 600;
++				$displayName = str_replace('"', '\\"', $filename);
++				$s3 = Z_Core::$AWS->createS3();
++				$cmdArgs = [
++					'Bucket' => $bucket,
++					'Key' => $hash,
++					'ResponseContentType' => $contentType,
++					'ResponseContentDisposition' => 'inline; filename="' . $displayName . '"',
++				];
++				$cmd = $s3->getCommand('GetObject', $cmdArgs);
++				$req = $s3->createPresignedRequest($cmd, '+' . $ttl . ' seconds');
++				return (string) $req->getUri();
++			}
++			catch (Exception $e) {
++				Z_Core::logError(
++					'generateSignedURL: presigned S3 URL failed, falling back to legacy proxy format: '
++					. $e->getMessage()
++				);
++				// fall through to the legacy code below
++			}
++		}
++
++		// Legacy path: HMAC-signed attachment-proxy URL (used for upload URLs)
+ 		$extURLPrefix = Z_CONFIG::$ATTACHMENT_PROXY_URL;
+ 		if ($extURLPrefix[strlen($extURLPrefix) - 1] != "/") {
+ 			$extURLPrefix .= "/";

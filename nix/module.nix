@@ -117,9 +117,19 @@ let
   #   localhost docker dev with no SSL) and we want `https://` for
   #   production hosts with ACME on the attachments hostname. Sed gives
   #   us the option to substitute the scheme at module-build time.
+  # - 0005: rewrite Attachments::generateSignedURL() to return AWS SDK V4
+  #   presigned S3 URLs for download URLs (when payload contains 'hash')
+  #   instead of the upstream HMAC-signed attachment-proxy format. The
+  #   custom proxy format requires a separate proxy service that
+  #   upstream zotero/dataserver doesn't open-source and the NixOS
+  #   module doesn't ship; presigned URLs let minio validate the V4
+  #   signature itself and serve the file directly. Without this, the
+  #   web library's PDF reader fails to load any attachment with a
+  #   400 from minio (it can't parse the custom URL format).
   dataserverPatches = [
     ../src/patches/dataserver/0001-increase-capacity-and-replenishRate-to-avoid-trigger.patch
     ../src/patches/dataserver/0002-config-aws-for-local-minio-server.patch
+    ../src/patches/dataserver/0005-presigned-s3-urls-for-downloads.patch
   ];
 
   composerVendor = pkgs.stdenvNoCC.mkDerivation {
