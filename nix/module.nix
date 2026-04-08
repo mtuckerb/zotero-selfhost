@@ -316,7 +316,19 @@ let
     pname = "zotero-web-library";
     version = "git";
     src = cfg.webLibrarySrc;
-    nativeBuildInputs = [ pkgs.nodejs_20 pkgs.cacert pkgs.gnused ];
+    # curl + unzip are needed by scripts/fetch-or-build-modules.mjs which
+    # downloads pre-built reader/pdf-worker/note-editor zips from
+    # zotero-download.s3.amazonaws.com. python3 is needed for the
+    # webLibraryHtmlPatcher script. cacert is needed for HTTPS fetches
+    # (npm registry, zotero-download S3, etc).
+    nativeBuildInputs = [
+      pkgs.nodejs_20
+      pkgs.cacert
+      pkgs.gnused
+      pkgs.python3
+      pkgs.curl
+      pkgs.unzip
+    ];
     dontBuild = true;
     dontFixup = true;
     installPhase = ''
