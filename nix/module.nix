@@ -630,12 +630,12 @@ in {
 
     streamServerNodeDepsHash = mkOption {
       type = types.str;
-      default = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+      default = "sha256-w0KmEH47XGW4MRfndk9r7c2I37QzFXRXwj05YslVVdw=";
       description = ''
         SRI hash of the pre-fetched node_modules for the stream server.
-        Set to a known-good value when bumping streamServerSrc or
-        streamServerPatches; the default is a placeholder that will
-        force the FOD to fail with the real hash printed in the error.
+        When you bump streamServerSrc or streamServerPatches, set this
+        to lib.fakeHash temporarily, run nixos-rebuild, copy the real
+        hash from the "got:" line in the error, and set it here.
       '';
     };
 
