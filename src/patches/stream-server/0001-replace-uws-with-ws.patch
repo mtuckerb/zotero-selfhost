@@ -1,0 +1,75 @@
+From 0000000000000000000000000000000000000001 Mon Sep 17 00:00:00 2001
+From: NixOS module overlay <noreply@example.com>
+Date: Wed, 8 Apr 2026 00:00:00 +0000
+Subject: [PATCH] Replace uws with ws
+
+The upstream zotero/stream-server depends on uws (µWebSockets)
+10.148.1, an abandoned native module with no prebuilt binaries for
+modern Node and source that no longer compiles against modern Node
+ABI. Replace with `ws` ^7.5.10 which is API-compatible for everything
+this codebase uses except `upgradeReq`, which the connection handler
+now stashes from the second `req` argument.
+
+`ws` was already a devDependency (^6.1.2) for tests; we promote it to
+a runtime dependency at ^7.5.10 and drop the devDependency entry.
+---
+diff --git a/connections.js b/connections.js
+index 8b17310..66a0b0f 100644
+--- a/connections.js
++++ b/connections.js
+@@ -24,7 +24,7 @@
+ 
+ var config = require('config');
+ var randomstring = require('randomstring');
+-var WebSocket = require('uws');
++var WebSocket = require('ws');
+ var utils = require('./utils');
+ var log = require('./log');
+ var statsD = require('./statsd');
+diff --git a/package.json b/package.json
+index 9a067fb..9c2f72a 100644
+--- a/package.json
++++ b/package.json
+@@ -23,14 +23,13 @@
+ 		"redis": "^2.8.0",
+ 		"request": "^2.88.0",
+ 		"strftime": "^0.10.0",
+-		"uws": "10.148.1"
++		"ws": "^7.5.10"
+ 	},
+ 	"devDependencies": {
+ 		"chai": "^1.10.0",
+ 		"mocha": "^5.2.0",
+ 		"mockery": "^1.4.0",
+-		"sinon": "^2.4.1",
+-		"ws": "^6.1.2"
++		"sinon": "^2.4.1"
+ 	},
+ 	"engines": {
+ 		"node": ">=0.12.0",
+diff --git a/server.js b/server.js
+index 70f772e..75f5f79 100644
+--- a/server.js
++++ b/server.js
+@@ -632,7 +632,7 @@ module.exports = function (onInit) {
+ 		});
+ 		
+ 		// Give server WebSocket powers
+-		var WebSocketServer = require('uws').Server;
++		var WebSocketServer = require('ws').Server;
+ 		wss = new WebSocketServer({
+ 			server: server,
+ 			verifyClient: function (info, cb) {
+@@ -646,7 +646,11 @@ module.exports = function (onInit) {
+ 			}
+ 		});
+ 		// The remote IP address is only available at connection time in the upgrade request
+-		wss.on('connection', function (ws) {
++		// `ws` v3+ removed `upgradeReq` and now passes the upgrade request as
++		// the second argument. Stash it on the socket so the rest of the
++		// code (which reads `ws.upgradeReq`) keeps working unchanged.
++		wss.on('connection', function (ws, req) {
++			ws.upgradeReq = req;
+ 			var remoteAddress = ws._socket.remoteAddress;
+ 			var xForwardedFor = ws.upgradeReq.headers['x-forwarded-for'];
+ 			if (remoteAddress && xForwardedFor) {

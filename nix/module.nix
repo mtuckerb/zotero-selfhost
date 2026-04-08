@@ -24,17 +24,34 @@ let
     '';
   };
 
+  # Patches applied to the upstream zotero/stream-server source. The
+  # only patch (0001) replaces `uws` (an abandoned native µWebSockets
+  # binding with no prebuilt binaries for modern Node and source that no
+  # longer compiles against modern Node ABI) with `ws` ^7.5.10. Without
+  # this, streamServerNodeDeps' `npm install` either fails outright or
+  # silently produces a non-working uws fallback at runtime. The patch
+  # also handles `ws` v3+'s removal of the `upgradeReq` property by
+  # stashing the request from the connection handler's second arg.
+  streamServerPatches = [
+    ../src/patches/stream-server/0001-replace-uws-with-ws.patch
+  ];
+
   streamServerNodeDeps = pkgs.stdenvNoCC.mkDerivation {
     pname = "zotero-stream-server-node-deps";
     version = "git";
     src = cfg.streamServerSrc;
-    nativeBuildInputs = [ pkgs.nodejs pkgs.nodejs pkgs.cacert ];
+    patches = streamServerPatches;
+    nativeBuildInputs = [ pkgs.nodejs pkgs.cacert ];
     dontBuild = true;
     dontFixup = true;
     installPhase = ''
       export HOME=$TMPDIR
       export npm_config_cache=$TMPDIR/npm-cache
-      npm ci --omit=dev
+      # `npm install` instead of `npm ci` because the patch above changes
+      # package.json (drops uws, adds ws) and the upstream package-lock.json
+      # is now stale; `npm ci` would refuse with EUSAGE. The FOD outputHash
+      # still pins the resulting node_modules content for reproducibility.
+      npm install --omit=dev --no-audit --no-fund
       cp -r node_modules $out
     '';
     outputHashAlgo = "sha256";
@@ -46,6 +63,7 @@ let
     pname = "zotero-selfhost-stream-server";
     version = "git";
     src = cfg.streamServerSrc;
+    patches = streamServerPatches;
     nativeBuildInputs = [ pkgs.makeWrapper pkgs.nodejs ];
     dontBuild = true;
     installPhase = ''
@@ -612,8 +630,13 @@ in {
 
     streamServerNodeDepsHash = mkOption {
       type = types.str;
-      default = "sha256-B0dIHRdxvANv3Q7LHgNHpFDAcxKDxUznEpkyt0s31ak=";
-      description = "SRI hash of the pre-fetched node_modules for the stream server.";
+      default = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+      description = ''
+        SRI hash of the pre-fetched node_modules for the stream server.
+        Set to a known-good value when bumping streamServerSrc or
+        streamServerPatches; the default is a placeholder that will
+        force the FOD to fail with the real hash printed in the error.
+      '';
     };
 
     tinymceNodeDepsHash = mkOption {
