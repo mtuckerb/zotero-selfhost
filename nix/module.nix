@@ -939,7 +939,9 @@ in {
       services.nginx = {
         enable = true;
         recommendedProxySettings = true;
-        recommendedTlsSettings = true;
+        # Note: TLS settings are intentionally not set here. They are a host-wide
+        # concern; users should configure recommendedTlsSettings themselves if
+        # their nginx build supports the required directives.
         virtualHosts.${cfg.infrastructure.hostname} = {
           enableACME = cfg.infrastructure.enableACME;
           forceSSL = cfg.infrastructure.forceSSL;
