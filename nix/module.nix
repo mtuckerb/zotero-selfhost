@@ -183,6 +183,21 @@ let
         -e "s|'scheme' => 'http'|'scheme' => '${cfg.s3.scheme}'|" \
         $out/share/zotero-dataserver/include/header.inc.php
 
+      # Convert MySQL 8.0+ row-alias INSERT...ON DUPLICATE KEY UPDATE
+      # syntax to the legacy VALUES(col) form that MariaDB still
+      # supports. The dataserver was written against MySQL 8 and uses
+      #   INSERT INTO storageFileItems (...) VALUES (?,?,?,?) AS new
+      #   ON DUPLICATE KEY UPDATE storageFileID=new.storageFileID, ...
+      # MariaDB 11.4 (the NixOS default) doesn't recognize the row
+      # alias and aborts with "near 'AS new'". This blocks PDF upload
+      # registration: the multipart POST to minio succeeds with HTTP
+      # 201 but the dataserver's Storage::registerUpload then fails
+      # to record the file metadata.
+      ${pkgs.gnused}/bin/sed -i \
+        -e 's|VALUES (?,?,?,?) AS new|VALUES (?,?,?,?)|' \
+        -e 's|storageFileID=new\.storageFileID, mtime=new\.mtime, size=new\.size|storageFileID=VALUES(storageFileID), mtime=VALUES(mtime), size=VALUES(size)|' \
+        $out/share/zotero-dataserver/model/Storage.inc.php
+
       # Extract Zend Framework 1 — bundled in this repo at
       # src/patches/dataserver/Zend.tar.gz. The upstream zotero/dataserver
       # expects ZF1 to live in include/Zend/ but ships an empty Zend/
