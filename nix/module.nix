@@ -254,6 +254,47 @@ let
     '';
   };
 
+  # Python script that rewrites src/html/index.html in the web-library
+  # build to substitute our user-config and menu-config blocks. Using
+  # a separate file (rather than a heredoc) avoids the Nix `''` string
+  # interpolation eating Python's triple-quoted strings.
+  webLibraryHtmlPatcher = pkgs.writeText "patch-index-html.py" ''
+    import re, sys
+    path = sys.argv[1]
+    src = open(path).read()
+    user_slug = ${"\""}${cfg.webLibrary.userSlug}${"\""}
+    user_id   = ${"\""}${cfg.webLibrary.userId}${"\""}
+    api_key   = ${"\""}${cfg.webLibrary.apiKey}${"\""}
+    new_config = (
+        '<script type="application/json" id="zotero-web-library-config">\n'
+        '\t\t{\n'
+        '\t\t\t"userSlug": "' + user_slug + '",\n'
+        '\t\t\t"userId": "' + user_id + '",\n'
+        '\t\t\t"apiKey": "' + api_key + '"\n'
+        '\t\t}\n'
+        '\t</script>'
+    )
+    src = re.sub(
+        r'<script type="application/json" id="zotero-web-library-config">.*?</script>',
+        lambda m: new_config,
+        src, count=1, flags=re.DOTALL,
+    )
+    new_menu = (
+        '<script type="application/json" id="zotero-web-library-menu-config">\n'
+        '\t\t{\n'
+        '\t\t\t"desktop": [{ "label": "My Library", "href": "/' + user_slug + '/library", "active": true }],\n'
+        '\t\t\t"mobile":  [{ "label": "My Library", "href": "/' + user_slug + '/library", "active": true }]\n'
+        '\t\t}\n'
+        '\t</script>'
+    )
+    src = re.sub(
+        r'<script type="application/json" id="zotero-web-library-menu-config">.*?</script>',
+        lambda m: new_menu,
+        src, count=1, flags=re.DOTALL,
+    )
+    open(path, 'w').write(src)
+  '';
+
   # zotero/web-library SPA build. Wrapped as a fixed-output derivation
   # because the build needs network at multiple stages: npm install for
   # dependencies, build:locale and build:styles-json for fetching CSL
@@ -302,39 +343,10 @@ let
         -e "s|https?://zotero.org/|https?://(?:zotero\\\\.org\\|${pkgs.lib.replaceStrings ["."] ["\\\\."] cfg.webLibrary.hostname})/|g" \
         src/js/utils.js
 
-      # Inject the user's config + minimal menu into the demo index.html.
-      # We use a python helper because the upstream block has multiline
-      # JSON that's awkward to match with sed. The python is bundled
-      # with the nix store nodejs build deps already.
-      ${pkgs.python3}/bin/python3 -c "$(cat <<PYEOF
-import re, sys
-src = open('src/html/index.html').read()
-new_config = '''<script type="application/json" id="zotero-web-library-config">
-\t\t{
-\t\t\t"userSlug": "${cfg.webLibrary.userSlug}",
-\t\t\t"userId": "${cfg.webLibrary.userId}",
-\t\t\t"apiKey": "${cfg.webLibrary.apiKey}"
-\t\t}
-\t</script>'''
-src = re.sub(
-    r'<script type="application/json" id="zotero-web-library-config">.*?</script>',
-    lambda m: new_config,
-    src, count=1, flags=re.DOTALL,
-)
-new_menu = '''<script type="application/json" id="zotero-web-library-menu-config">
-\t\t{
-\t\t\t"desktop": [{ "label": "My Library", "href": "/${cfg.webLibrary.userSlug}/library", "active": true }],
-\t\t\t"mobile":  [{ "label": "My Library", "href": "/${cfg.webLibrary.userSlug}/library", "active": true }]
-\t\t}
-\t</script>'''
-src = re.sub(
-    r'<script type="application/json" id="zotero-web-library-menu-config">.*?</script>',
-    lambda m: new_menu,
-    src, count=1, flags=re.DOTALL,
-)
-open('src/html/index.html', 'w').write(src)
-PYEOF
-)"
+      # Inject the user's config + minimal menu into the demo index.html
+      # via a python helper. The upstream config blocks are multiline
+      # JSON that's awkward to match with sed.
+      ${pkgs.python3}/bin/python3 ${webLibraryHtmlPatcher} src/html/index.html
 
       # Install + build
       npm install --no-audit --no-fund --legacy-peer-deps
