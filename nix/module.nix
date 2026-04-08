@@ -1044,6 +1044,17 @@ in {
         description = "Public hostname that reverse proxies MinIO for attachment download URLs.";
       };
 
+      attachmentMaxBodySize = mkOption {
+        type = types.str;
+        default = "2g";
+        description = ''
+          nginx `client_max_body_size` value applied to the attachments
+          vhost. nginx's default of 1m would silently reject any Zotero
+          PDF over 1 MB with HTTP 413. The default here (2g) covers
+          everything reasonable while still capping pathological uploads.
+        '';
+      };
+
       enableACME = mkOption {
         type = types.bool;
         default = false;
@@ -1495,6 +1506,13 @@ in {
         virtualHosts.${cfg.infrastructure.attachmentsHostname} = {
           enableACME = cfg.infrastructure.enableACME;
           forceSSL = cfg.infrastructure.forceSSL;
+          # nginx defaults client_max_body_size to 1m, which silently kills
+          # any attachment upload over that size — Zotero PDFs are routinely
+          # 10–100 MB. Raise the cap on this vhost specifically so the
+          # presigned-URL POST flow has room to deliver the file body.
+          extraConfig = ''
+            client_max_body_size ${cfg.infrastructure.attachmentMaxBodySize};
+          '';
           locations."/" = {
             # When the bundled minio is disabled, follow whatever endpointUrl
             # the operator configured (existing minio, AWS S3, R2, etc).
