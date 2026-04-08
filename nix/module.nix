@@ -367,7 +367,29 @@ let
       # `#!/usr/bin/env` lines to absolute store paths.
       npm install --no-audit --no-fund --legacy-peer-deps --ignore-scripts
       patchShebangs node_modules
-      npm run build
+
+      # Run the prepare tasks individually rather than via npm run build
+      # so we get real stdout/stderr instead of the task-runner's
+      # truncated one-liner. Order doesn't matter (they're parallelizable).
+      mkdir -p build/static/web-library/
+      node scripts/store-version.mjs
+      node scripts/collect-locale.mjs
+      node scripts/fetch-or-build-modules.mjs
+      node scripts/fetch-fonts.mjs
+      node scripts/build-styles-json.mjs
+      node scripts/check-icons.mjs
+      node scripts/prepare-citeproc-js.mjs
+
+      # Build steps
+      NODE_ENV=production npx rollup -c
+      for f in src/scss/*.scss; do
+        npx sass --no-source-map "$f" "build/static/web-library/$(basename "$f" .scss).css"
+      done
+      mkdir -p build/
+      cp -arL src/html/* build/
+      mkdir -p build/static/web-library/
+      cp -arL src/static/* build/static/web-library/
+      npx postcss build/static/web-library/zotero-web-library.css --use autoprefixer --no-map -r
 
       mkdir -p $out
       cp -r build/* $out/
