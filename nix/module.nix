@@ -861,7 +861,7 @@ in {
 
     webLibraryHash = mkOption {
       type = types.str;
-      default = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+      default = "sha256-Cu2gPzmcPeRXSqhi7NNGF0LMASb/fP6JX+eLBx3rqxo=";
       description = ''
         SRI hash of the built web-library bundle (the result of
         `npm install && npm run build`). The build is wrapped as a
