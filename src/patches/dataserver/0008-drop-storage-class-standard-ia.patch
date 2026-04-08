@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000008 Mon Sep 17 00:00:00 2001
+From: NixOS module overlay <noreply@example.com>
+Date: Wed, 8 Apr 2026 00:00:00 +0000
+Subject: [PATCH 8/8] Don't request STANDARD_IA storage class for fulltext puts
+
+Zotero_FullText::indexItem requests AWS S3's STANDARD_IA (Infrequent
+Access) storage class for any gzipped fulltext payload >= 75 KB:
+
+    'StorageClass' => strlen($json) < self::$minFileSizeStandardIA
+        ? 'STANDARD'
+        : 'STANDARD_IA'
+
+This is a cost-optimization for the hosted zotero.org backend (cheaper
+S3 tier for less-frequently-accessed content). It is silently fatal
+against minio: minio supports the S3 putObject API with StorageClass
+but only accepts a small set of valid values, none of which are
+STANDARD_IA. The PutObject call returns:
+
+    Invalid storage class
+
+…which surfaces as a generic AWS SDK exception. The exception bubbles
+up through Zotero_FullText::indexItem to the catch block in
+updateMultipleFromJSON, which rolls back the MySQL itemFulltext write
+and reports the failure to the client. The desktop client surfaces
+this as "ZoteroObjectUploadError: An error occurred" with no detail.
+
+Failure is content-size-dependent: any item whose extracted PDF text,
+gzipped, exceeds ~75 KB triggers the bug. Smaller items go through
+the STANDARD branch and succeed, which makes the bug look intermittent.
+
+Drop the StorageClass parameter entirely and let the backend pick its
+default (which on minio is the only valid option anyway). For
+self-hosted deployments the cost-tier optimization is meaningless.
+---
+diff --git a/model/FullText.inc.php b/model/FullText.inc.php
+index 1234567..89abcde 100644
+--- a/model/FullText.inc.php
++++ b/model/FullText.inc.php
+@@ -79,7 +79,10 @@
+ 			'Key' => $libraryID . "/" . $key,
+ 			'Body' => $json,
+ 			'ContentType' => 'application/gzip',
+-			'StorageClass' => strlen($json) < self::$minFileSizeStandardIA ? 'STANDARD' : 'STANDARD_IA'
++			// Self-hosted: don't request StorageClass. minio rejects
++			// STANDARD_IA with 'Invalid storage class' for any fulltext
++			// payload over ~75 KB gzipped, silently breaking fulltext
++			// sync for non-trivial PDFs.
+ 		]);
+ 		StatsD::timing("s3.fulltext.put", (microtime(true) - $start) * 1000);
+
