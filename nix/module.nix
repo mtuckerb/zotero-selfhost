@@ -348,8 +348,13 @@ let
       # JSON that's awkward to match with sed.
       ${pkgs.python3}/bin/python3 ${webLibraryHtmlPatcher} src/html/index.html
 
-      # Install + build
-      npm install --no-audit --no-fund --legacy-peer-deps
+      # Install + build. --ignore-scripts because some npm packages have
+      # postinstall hooks that use `#!/usr/bin/env <foo>` shebangs
+      # which fail in the nix sandbox (no /usr/bin/env). After install
+      # we patchShebangs the node_modules tree to rewrite all
+      # `#!/usr/bin/env` lines to absolute store paths.
+      npm install --no-audit --no-fund --legacy-peer-deps --ignore-scripts
+      patchShebangs node_modules
       npm run build
 
       mkdir -p $out
