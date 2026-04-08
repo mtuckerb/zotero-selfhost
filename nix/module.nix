@@ -1483,6 +1483,23 @@ in {
                 '';
               };
 
+              # /retractions/list — hosted-zotero.org-only endpoint that
+              # the desktop client polls on every sync. Upstream
+              # zotero/dataserver doesn't implement it, so on a self-host
+              # the request falls through to the SPA root and trips the
+              # basic-auth gate, surfacing as a noisy
+              # "401 Authorization Required" in the client log on every
+              # sync. Stub it: return an empty list with no auth, no
+              # proxy. The client treats "no retractions" as the normal
+              # case and stops complaining.
+              "= /retractions/list" = {
+                extraConfig = ''
+                  auth_basic off;
+                  default_type application/json;
+                  return 200 '[]';
+                '';
+              };
+
               # SPA static assets — index.html references these as
               # /static/web-library/... (root-relative).
               "/static/web-library/" = {
