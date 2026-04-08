@@ -328,6 +328,7 @@ let
       pkgs.python3
       pkgs.curl
       pkgs.unzip
+      pkgs.git  # scripts/fetch-or-build-modules.mjs runs `git rev-parse HEAD` per submodule
     ];
     dontBuild = true;
     dontFixup = true;
@@ -836,7 +837,12 @@ in {
       default = pkgs.fetchgit {
         url = "https://github.com/zotero/web-library.git";
         rev = "1e95df8a6f0ac088d84ce103ec486028f294f8f1";  # main HEAD as of 2026-04-08
-        sha256 = "sha256-u6pn7g/7KYOWvIcQrfkPMofgFry7OzkltgCuo8tlgMQ=";
+        # leaveDotGit so scripts/fetch-or-build-modules.mjs can call
+        # `git rev-parse HEAD` inside each modules/<submodule> dir to
+        # determine the matching prebuild artifact URL on
+        # zotero-download.s3.amazonaws.com.
+        leaveDotGit = true;
+        sha256 = "sha256-x2tLXabG0A5Q0xDBuCjzNjvG2BJt1oB1fx0uxmGKM5Y=";
         fetchSubmodules = true;
       };
       description = ''
