@@ -103,14 +103,23 @@ let
   # Patches applied to the upstream zotero/dataserver source before composer
   # install + the runtime build. These were originally part of the docker
   # workflow's utils/patch.sh and the nix module wasn't applying them.
-  # Patch 0003 (debug logging in FullText.inc.php) is intentionally omitted
-  # because it no longer applies cleanly to the current pinned dataserver
-  # source — it's the least important of the four (just adds an
-  # error_log line) and isn't needed for the upload flow to work.
+  #
+  # - 0001: increase rate-limit capacity (web library easily trips the
+  #   default; the upstream zotero.org service has a much larger budget).
+  # - 0002: AWS SDK use_path_style_endpoint + endpoint pointing at minio.
+  # - 0003: extra debug logging in FullText.inc.php — INTENTIONALLY OMITTED
+  #   because it no longer applies cleanly to the current pinned dataserver
+  #   source. It's just an error_log line and isn't needed for upload.
+  # - 0004: rewrite Storage::getUploadBaseURL() to return a minio URL
+  #   instead of the hardcoded https://<bucket>.s3.amazonaws.com/.
+  #   APPLIED OUT-OF-BAND VIA SED below in dataserverPkg.installPhase
+  #   because the upstream patch hardcodes `http://` (it was written for
+  #   localhost docker dev with no SSL) and we want `https://` for
+  #   production hosts with ACME on the attachments hostname. Sed gives
+  #   us the option to substitute the scheme at module-build time.
   dataserverPatches = [
     ../src/patches/dataserver/0001-increase-capacity-and-replenishRate-to-avoid-trigger.patch
     ../src/patches/dataserver/0002-config-aws-for-local-minio-server.patch
-    ../src/patches/dataserver/0004-use-http-instead-of-https-to-support-localhost-serve.patch
   ];
 
   composerVendor = pkgs.stdenvNoCC.mkDerivation {
@@ -148,6 +157,17 @@ let
       mkdir -p $out/share/zotero-dataserver
       rsync -a --exclude .git --exclude tests --exclude tmp --exclude vendor ./ $out/share/zotero-dataserver/
       chmod -R u+w $out/share/zotero-dataserver
+
+      # Replace the hardcoded amazonaws.com upload URL with a path-style
+      # minio URL. We use the configured scheme (https when ACME is on,
+      # http when not) so the browser POST URL matches what nginx serves
+      # on the attachments host — without this, the browser PUTs to
+      # http://... which 301-redirects to https://, and 301 doesn't
+      # preserve the POST body so the upload silently fails. This
+      # replaces the upstream patch 0004 which hardcodes http://.
+      ${pkgs.gnused}/bin/sed -i \
+        's|return "https://" \. Z_CONFIG::\$S3_BUCKET \. "\.s3\.amazonaws\.com/";|return "${cfg.s3.scheme}://" . Z_CONFIG::$S3_ENDPOINT . "/" . Z_CONFIG::$S3_BUCKET . "/";|' \
+        $out/share/zotero-dataserver/model/Storage.inc.php
 
       # Extract Zend Framework 1 — bundled in this repo at
       # src/patches/dataserver/Zend.tar.gz. The upstream zotero/dataserver
@@ -731,6 +751,18 @@ in {
       region = mkOption { type = types.str; default = "us-east-1"; };
       endpoint = mkOption { type = types.str; default = "127.0.0.1:9000"; };
       endpointUrl = mkOption { type = types.nullOr types.str; default = null; };
+      scheme = mkOption {
+        type = types.enum [ "http" "https" ];
+        default = "https";
+        description = ''
+          URL scheme returned to clients in storage upload URLs. Should be
+          `https` whenever the attachments host is served behind nginx with
+          ACME (the default for `infrastructure.enable = true`); `http` is
+          only appropriate for local docker dev with no SSL because the
+          browser POST upload body would otherwise be lost across the
+          301 redirect that nginx serves on the http listener.
+        '';
+      };
       bucket = mkOption { type = types.str; default = "zotero"; };
       fulltextBucket = mkOption { type = types.str; default = "zotero-fulltext"; };
       createBuckets = mkOption { type = types.bool; default = false; };
