@@ -784,8 +784,8 @@ in {
       type = types.path;
       default = pkgs.fetchgit {
         url = "https://github.com/zotero/web-library.git";
-        rev = "1b08825422996b3ee5480a372577b90d2b0e8e71";  # v1.7.5
-        sha256 = "sha256-829dDg5dgwCO6GVFyIaZKhRExaq593sNJmNi76DkOzw=";
+        rev = "1e95df8a6f0ac088d84ce103ec486028f294f8f1";  # main HEAD as of 2026-04-08
+        sha256 = "sha256-u6pn7g/7KYOWvIcQrfkPMofgFry7OzkltgCuo8tlgMQ=";
         fetchSubmodules = true;
       };
       description = ''
@@ -795,6 +795,10 @@ in {
         required at build time. Use pkgs.fetchgit { fetchSubmodules =
         true; ... } to fetch them — pkgs.fetchFromGitHub does not
         currently support fetchSubmodules in nixos-25.05.
+
+        We pin to a recent main HEAD rather than the v1.7.5 tag because
+        the tagged release has a different scripts/ layout that doesn't
+        match the build patches in webLibraryPkg.
       '';
     };
 
