@@ -1,0 +1,38 @@
+From 0000000000000000000000000000000000000006 Mon Sep 17 00:00:00 2001
+From: NixOS module overlay <noreply@example.com>
+Date: Wed, 8 Apr 2026 00:00:00 +0000
+Subject: [PATCH 6/6] Remove per-user storage quota for self-hosted deployments
+
+Upstream zotero/dataserver enforces a 300 MB default storage quota per
+user (Zotero_Storage::$defaultQuota), with per-user overrides stored in
+zotero_master.storageAccounts. This is the same quota model as the
+hosted zotero.org free tier — sensible there, pointless in a
+self-hosted deployment where the operator already controls the storage
+backend (minio / S3) and any disk-level limits live there, not in PHP.
+
+Without this patch, every fresh user hits "out of space" errors from
+the sync engine after ~300 MB of attachments and the only fix is to
+manually INSERT a row into storageAccounts and bounce memcached, which
+is a confusing first-run experience.
+
+Bump the default to 10 TB (10485760 MB). This still goes through
+getEffectiveUserQuota's per-user override path, so an operator who
+wants to enforce real per-user limits can still do so via the
+storageAccounts table — we're only changing what new/unconfigured
+users get by default.
+---
+diff --git a/model/Storage.inc.php b/model/Storage.inc.php
+index 1234567..89abcde 100644
+--- a/model/Storage.inc.php
++++ b/model/Storage.inc.php
+@@ -25,7 +25,9 @@
+ */
+
+ class Zotero_Storage {
+-	public static $defaultQuota = 300;
++	// Self-hosted: default to effectively unlimited (10 TB in MB).
++	// Per-user overrides via storageAccounts still work as before.
++	public static $defaultQuota = 10485760;
+ 	public static $uploadQueueLimit = 10;
+ 	public static $uploadQueueTimeout = 300;
+ 	private static $s3PresignedRequestTTL = 3600;
