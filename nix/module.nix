@@ -12,6 +12,15 @@ let
       short_open_tag = On
       display_errors = Off
       error_reporting = E_ALL & ~E_NOTICE & ~E_STRICT & ~E_DEPRECATED
+      ; htdocs/index.php does `require('config/routes.inc.php')` and uses
+      ; constants defined in include/header.inc.php — both need to be on the
+      ; include path. Without auto_prepend_file the runtime sees Z_ENV_*
+      ; constants as undefined and returns silent HTTP 500 (display_errors
+      ; is Off and `php -S` swallows stderr). The upstream Apache config
+      ; auto-prepends header.inc.php; `php -S` doesn't unless the ini says
+      ; so explicitly.
+      include_path = ".:${dataserverRuntime}/htdocs:${dataserverRuntime}/include"
+      auto_prepend_file = "${dataserverRuntime}/include/header.inc.php"
     '';
   };
 
@@ -91,10 +100,24 @@ let
     '';
   };
 
+  # Patches applied to the upstream zotero/dataserver source before composer
+  # install + the runtime build. These were originally part of the docker
+  # workflow's utils/patch.sh and the nix module wasn't applying them.
+  # Patch 0003 (debug logging in FullText.inc.php) is intentionally omitted
+  # because it no longer applies cleanly to the current pinned dataserver
+  # source — it's the least important of the four (just adds an
+  # error_log line) and isn't needed for the upload flow to work.
+  dataserverPatches = [
+    ../src/patches/dataserver/0001-increase-capacity-and-replenishRate-to-avoid-trigger.patch
+    ../src/patches/dataserver/0002-config-aws-for-local-minio-server.patch
+    ../src/patches/dataserver/0004-use-http-instead-of-https-to-support-localhost-serve.patch
+  ];
+
   composerVendor = pkgs.stdenvNoCC.mkDerivation {
     pname = "zotero-dataserver-composer-deps";
     version = "git";
     src = cfg.dataserverSrc;
+    patches = dataserverPatches;
     nativeBuildInputs = [ php pkgs.php84Packages.composer pkgs.cacert ];
     dontBuild = true;
     dontFixup = true;
@@ -114,6 +137,7 @@ let
     pname = "zotero-selfhost-dataserver";
     version = "git";
     src = cfg.dataserverSrc;
+    patches = dataserverPatches;
     nativeBuildInputs = [ php pkgs.php84Packages.composer pkgs.rsync ];
     dontBuild = true;
     # The upstream dataserver repo has a dangling symlink (htdocs/schema -> zotero-schema/schema.json)
@@ -124,6 +148,24 @@ let
       mkdir -p $out/share/zotero-dataserver
       rsync -a --exclude .git --exclude tests --exclude tmp --exclude vendor ./ $out/share/zotero-dataserver/
       chmod -R u+w $out/share/zotero-dataserver
+
+      # Extract Zend Framework 1 — bundled in this repo at
+      # src/patches/dataserver/Zend.tar.gz. The upstream zotero/dataserver
+      # expects ZF1 to live in include/Zend/ but ships an empty Zend/
+      # directory (only .gitignore). The docker workflow's utils/patch.sh
+      # extracts the tarball after applying patches; do the same here.
+      ${pkgs.gnutar}/bin/tar -xzf ${../src/patches/dataserver/Zend.tar.gz} \
+        -C $out/share/zotero-dataserver/include/
+
+      # Drop the bundled zotero-schema submodule contents into htdocs/.
+      # zotero-schema is a git submodule of the upstream dataserver but
+      # GitHub's tarball doesn't include submodules, so the runtime
+      # Schema::init() throws "Locales not available" → silent HTTP 500
+      # on /itemTypes etc.
+      mkdir -p $out/share/zotero-dataserver/htdocs/zotero-schema
+      cp ${cfg.zoteroSchemaSrc}/schema.json \
+        $out/share/zotero-dataserver/htdocs/zotero-schema/schema.json
+
       cp -r ${composerVendor} $out/share/zotero-dataserver/vendor
       chmod -R u+w $out/share/zotero-dataserver/vendor
       export HOME=$TMPDIR
@@ -358,7 +400,10 @@ let
         mysql -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$MYSQL_USER" "$@"
       }
 
-      echo "SET @@global.innodb_large_prefix = 1;" | mysql_base
+      # innodb_large_prefix was removed in MariaDB 10.5+; DYNAMIC row
+      # format is the default now and the variable no longer exists.
+      # Setting it returns "Unknown system variable" and aborts the
+      # init script. Skip on modern MariaDB.
       echo 'set global sql_mode = "";' | mysql_base
 
       for db in ${cfg.mysql.masterDb} ${cfg.mysql.shardDb} zotero_shard_2 ${cfg.mysql.idsDb} ${cfg.mysql.wwwDb}; do
@@ -373,15 +418,26 @@ let
       echo "INSERT INTO shardHosts VALUES (1, '${cfg.mysql.host}', ${toString cfg.mysql.port}, 'up');" | mysql_base ${cfg.mysql.masterDb}
       echo "INSERT INTO shards VALUES (1, 1, '${cfg.mysql.shardDb}', 'up', '1');" | mysql_base ${cfg.mysql.masterDb}
       echo "INSERT INTO shards VALUES (2, 1, 'zotero_shard_2', 'up', '1');" | mysql_base ${cfg.mysql.masterDb}
-      echo "INSERT INTO libraries VALUES (1, 'user', CURRENT_TIMESTAMP, 0, 1)" | mysql_base ${cfg.mysql.masterDb}
-      echo "INSERT INTO libraries VALUES (2, 'group', CURRENT_TIMESTAMP, 0, 2)" | mysql_base ${cfg.mysql.masterDb}
-      echo "INSERT INTO users VALUES (1, 1, '$superuser_name_sql', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)" | mysql_base ${cfg.mysql.masterDb}
+      # libraries schema has 6 columns (libraryID, libraryType, lastUpdated,
+      # version, shardID, hasData). The previous unnamed-column INSERT
+      # provided 5 values and aborted with "Column count doesn't match".
+      echo "INSERT INTO libraries (libraryID, libraryType, lastUpdated, version, shardID, hasData) VALUES (1, 'user', CURRENT_TIMESTAMP, 0, 1, 0)" | mysql_base ${cfg.mysql.masterDb}
+      echo "INSERT INTO libraries (libraryID, libraryType, lastUpdated, version, shardID, hasData) VALUES (2, 'group', CURRENT_TIMESTAMP, 0, 2, 0)" | mysql_base ${cfg.mysql.masterDb}
+      # zotero_master.users schema has 3 columns (userID, libraryID,
+      # username). The previous INSERT provided 5 values including
+      # timestamps that aren't part of the table. Use named columns.
+      echo "INSERT INTO users (userID, libraryID, username) VALUES (1, 1, '$superuser_name_sql')" | mysql_base ${cfg.mysql.masterDb}
       echo "INSERT INTO groups VALUES (1, 2, 'Shared', 'shared', 'Private', 'members', 'all', 'members', \"\", \"\", 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)" | mysql_base ${cfg.mysql.masterDb}
       echo "INSERT INTO groupUsers VALUES (1, 1, 'owner', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)" | mysql_base ${cfg.mysql.masterDb}
 
       mysql_base ${cfg.mysql.wwwDb} < ${cfg.wwwSql}
+      # The dataserver's storage quota check (Storage::getInstitutionalUserQuota)
+      # joins users_email to storage_institutions WHERE validated=1, but the
+      # bundled www.sql doesn't include a `validated` column. Add it after
+      # loading the schema and mark our seeded admin email as validated.
+      echo "ALTER TABLE users_email ADD COLUMN validated TINYINT(1) NOT NULL DEFAULT 0 AFTER email" | mysql_base ${cfg.mysql.wwwDb}
       echo "INSERT INTO users VALUES (1, '$superuser_name_sql', MD5('$superuser_password_sql'), 'normal')" | mysql_base ${cfg.mysql.wwwDb}
-      echo "INSERT INTO users_email (userID, email) VALUES (1, '$superuser_email_sql')" | mysql_base ${cfg.mysql.wwwDb}
+      echo "INSERT INTO users_email (userID, email, validated) VALUES (1, '$superuser_email_sql', 1)" | mysql_base ${cfg.mysql.wwwDb}
       echo "INSERT INTO storage_institutions (institutionID, domain, storageQuota) VALUES (1, 'zotero.org', 10000)" | mysql_base ${cfg.mysql.wwwDb}
       echo "INSERT INTO storage_institution_email (institutionID, email) VALUES (1, 'contact@zotero.org')" | mysql_base ${cfg.mysql.wwwDb}
 
@@ -389,9 +445,22 @@ let
         mysql_base "$shard" < "$misc/shard.sql"
         mysql_base "$shard" < "$misc/triggers.sql"
       done
-      echo "INSERT INTO shardLibraries VALUES (1, 'user', CURRENT_TIMESTAMP, 0)" | mysql_base ${cfg.mysql.shardDb}
-      echo "INSERT INTO shardLibraries VALUES (2, 'group', CURRENT_TIMESTAMP, 0)" | mysql_base zotero_shard_2
+      # shardLibraries schema has 5 columns (libraryID, libraryType,
+      # lastUpdated, version, storageUsage). Previous INSERT provided 4.
+      echo "INSERT INTO shardLibraries (libraryID, libraryType, lastUpdated, version, storageUsage) VALUES (1, 'user', CURRENT_TIMESTAMP, 0, 0)" | mysql_base ${cfg.mysql.shardDb}
+      echo "INSERT INTO shardLibraries (libraryID, libraryType, lastUpdated, version, storageUsage) VALUES (2, 'group', CURRENT_TIMESTAMP, 0, 0)" | mysql_base zotero_shard_2
       mysql_base ${cfg.mysql.idsDb} < "$misc/ids.sql"
+
+      # Ingest the schema.json mappings (item types, fields, creator
+      # types, locales) into the dataserver tables. Without this, write
+      # operations fail with "Field 'X' from schema N not found in
+      # ItemFields.inc.php" because coredata.sql only ships an old
+      # schema. The php here uses -d auto_prepend_file= to override the
+      # auto_prepend in php.ini (admin/schema_update has its own
+      # require('header.inc.php'), so without disabling auto_prepend
+      # the function gets declared twice → fatal redeclare).
+      ${php}/bin/php -d "auto_prepend_file=" \
+        ${dataserverPkg}/share/zotero-dataserver/admin/schema_update || true
 
       ${optionalString (cfg.s3.createBuckets && cfg.s3.endpointUrl != null) ''
         AWS_ACCESS_KEY_ID="$(read_secret ${escapeShellArg (secretPath secretKeys.s3AccessKey)})"
@@ -442,12 +511,16 @@ let
         mysql -h "$MYSQL_HOST" -P "$MYSQL_PORT" -u "$MYSQL_USER" "$@"
       }
 
-      echo "INSERT INTO libraries VALUES ($uid, 'user', CURRENT_TIMESTAMP, 0, 1)" | mysql_base ${cfg.mysql.masterDb}
-      echo "INSERT INTO users VALUES ($uid, $uid, '$username_sql', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)" | mysql_base ${cfg.mysql.masterDb}
+      # All four INSERTs below were broken against the current dataserver
+      # schema (column counts didn't match). They've been rewritten to use
+      # named columns to be robust against future schema additions and to
+      # match the column-count fixes in initScript above.
+      echo "INSERT INTO libraries (libraryID, libraryType, lastUpdated, version, shardID, hasData) VALUES ($uid, 'user', CURRENT_TIMESTAMP, 0, 1, 0)" | mysql_base ${cfg.mysql.masterDb}
+      echo "INSERT INTO users (userID, libraryID, username) VALUES ($uid, $uid, '$username_sql')" | mysql_base ${cfg.mysql.masterDb}
       echo "INSERT INTO groupUsers VALUES (1, $uid, 'member', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)" | mysql_base ${cfg.mysql.masterDb}
-      echo "INSERT INTO users VALUES ($uid, '$username_sql', MD5('$password_sql'))" | mysql_base ${cfg.mysql.wwwDb}
-      echo "INSERT INTO users_email (userID, email) VALUES ($uid, '$email_sql')" | mysql_base ${cfg.mysql.wwwDb}
-      echo "INSERT INTO shardLibraries VALUES ($uid, 'user', 0, 0)" | mysql_base ${cfg.mysql.shardDb}
+      echo "INSERT INTO users VALUES ($uid, '$username_sql', MD5('$password_sql'), 'normal')" | mysql_base ${cfg.mysql.wwwDb}
+      echo "INSERT INTO users_email (userID, email, validated) VALUES ($uid, '$email_sql', 1)" | mysql_base ${cfg.mysql.wwwDb}
+      echo "INSERT INTO shardLibraries (libraryID, libraryType, lastUpdated, version, storageUsage) VALUES ($uid, 'user', CURRENT_TIMESTAMP, 0, 0)" | mysql_base ${cfg.mysql.shardDb}
     '';
   };
 
@@ -510,6 +583,24 @@ in {
         sha256 = "0hyzr3xnhw5n6ds7z1mvll7kh83pas44jdywvrgi2f7wykmklzhi";
       };
       description = "Path to the Zotero TinyMCE clean server source tree.";
+    };
+
+    zoteroSchemaSrc = mkOption {
+      type = types.path;
+      default = pkgs.fetchFromGitHub {
+        owner = "zotero";
+        repo = "zotero-schema";
+        rev = "62e983a2e575fe9b9a3677ad7c9772080b67a1e4";
+        sha256 = "0yqsij69k6ssjs8nbha8bnx4lvk8k6nqg286v0a8awqgb2srimd1";
+      };
+      description = ''
+        Path to the zotero-schema source tree (must contain schema.json).
+        zotero-schema is a git submodule of upstream zotero/dataserver but
+        GitHub's source tarball doesn't include submodules, so we fetch it
+        separately and copy schema.json into htdocs/zotero-schema/ at build
+        time. Without this, Schema::init() throws "Locales not available"
+        and /itemTypes returns silent HTTP 500.
+      '';
     };
 
     wwwSql = mkOption {
@@ -751,6 +842,14 @@ in {
       "d ${cfg.stateDir}/errors 0750 ${cfg.user} ${cfg.group} - -"
       "d ${cfg.stateDir}/tmp 0770 ${cfg.user} ${cfg.group} - -"
       "d ${runtimeDir} 0750 ${cfg.user} ${cfg.group} - -"
+      # Pre-create runtime working directories before systemd checks each
+      # service's WorkingDirectory= (which is enforced before ExecStartPre
+      # runs, so the prepare scripts can never bootstrap them on first
+      # start without this).
+      "d ${dataserverRuntime} 0755 ${cfg.user} ${cfg.group} - -"
+      "d ${dataserverRuntime}/htdocs 0755 ${cfg.user} ${cfg.group} - -"
+      "d ${streamRuntime} 0755 ${cfg.user} ${cfg.group} - -"
+      "d ${tinymceRuntime} 0755 ${cfg.user} ${cfg.group} - -"
     ];
 
     environment.systemPackages = [ initScript createUserScript ];
@@ -771,7 +870,13 @@ in {
           mkdir -p ${streamRuntime}/config
           ln -sfn ${streamConfig} ${streamRuntime}/config/default.js
         '';
-        ExecStart = "${pkgs.nodejs}/bin/node ${streamRuntime}/index.js";
+        # Pin the runtime node to v20 LTS. The bundled `node-config` npm
+        # package calls `util.isRegExp` which was removed in Node 22+, and
+        # `pkgs.nodejs` currently tracks the latest LTS (24 as of 2026-04).
+        # Pure-JS deps installed by the FOD wrapper above are portable
+        # across node versions, so swapping only the runtime binary
+        # suffices and avoids invalidating streamServerNodeDepsHash.
+        ExecStart = "${pkgs.nodejs_20}/bin/node ${streamRuntime}/index.js";
         Restart = "always";
         RestartSec = 5;
       };
@@ -791,7 +896,8 @@ in {
           set -euo pipefail
           ${syncRuntime "${tinymceCleanServerPkg}/libexec/tinymce-clean-server" tinymceRuntime}
         '';
-        ExecStart = "${pkgs.nodejs}/bin/node ${tinymceRuntime}/server.js";
+        # Same Node 20 pin as the stream server above — see comment there.
+        ExecStart = "${pkgs.nodejs_20}/bin/node ${tinymceRuntime}/server.js";
         Restart = "always";
         RestartSec = 5;
       };
