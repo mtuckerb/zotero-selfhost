@@ -1079,7 +1079,15 @@ in {
       systemd.services.zotero-selfhost-minio = {
         description = "Zotero Selfhost MinIO object storage";
         wantedBy = [ "multi-user.target" ];
-        after = [ "network.target" ];
+        # Must wait for sops-install-secrets to decrypt the s3 access/secret
+        # key files before start. Without this, on a fresh boot the start
+        # script reads /run/secrets/zotero-selfhost/s3-{access,secret}-key as
+        # empty strings (the files don't exist yet) and minio falls back to
+        # its default minioadmin:minioadmin credentials. The dataserver then
+        # can't authenticate against minio (it's using the sops credentials)
+        # and PDF uploads return 403 InvalidAccessKeyId from minio.
+        after = [ "network.target" "sops-install-secrets.service" ];
+        wants = [ "sops-install-secrets.service" ];
         serviceConfig = {
           Type = "simple";
           User = cfg.user;
