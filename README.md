@@ -143,209 +143,18 @@ For a concrete deployment example, see:
 - `examples/nixos/zotero-selfhost-host.nix`
 - `examples/nixos/zotero-selfhost.sops.example.yaml`
 
-### NixOS gotchas — workarounds you must apply
+### One-time manual setup
 
-The NixOS module above has several latent issues that only surface once the
-service actually tries to handle a request. The bugs were originally hidden
-behind a sops-decryption failure that prevented the dataserver from starting
-at all; once that's fixed, you'll hit them in roughly this order. Below is
-a single drop-in override block you can paste into the same NixOS module
-where you set `services.zotero-selfhost.enable = true;`. Each block is
-explained in the comments. Tested on NixOS unstable + nixpkgs `nixos-25.05`
-+ MariaDB 11.4 + Node 24 (default `pkgs.nodejs`) as of 2026-04-08.
+A few things can't be done by the NixOS module itself and need to be
+run once after the first `nixos-rebuild switch`:
 
-You will also need a few one-time manual steps for things the module
-doesn't bootstrap (Zend Framework 1, the dataserver schema mapping tables,
-the MySQL user, the API key for the web library). Those are documented
-under "Manual setup steps" further below.
-
-```nix
-{ config, lib, pkgs, ... }:
-
-{
-  services.zotero-selfhost = {
-    enable = true;
-    sopsFile = "/data/zotero/zotero-selfhost.yaml";
-    # If port 8080 is taken on your host (e.g. by another service), set
-    # something else. nginx and the dataserver both follow this option.
-    listenPort = 8085;
-    # MariaDB on most NixOS hosts has root locked to unix_socket auth, so
-    # the dataserver and init script can't authenticate as root over TCP.
-    # Use a dedicated `zotero` user (created out of band — see below).
-    mysql.user = "zotero";
-    infrastructure = {
-      enable = true;
-      hostname = "zotero.example.com";
-      attachmentsHostname = "attachments.zotero.example.com";
-      enableACME = true;
-      forceSSL = true;
-      minioPort = 9002;
-      minioConsolePort = 9003;
-    };
-  };
-
-  # ── 1. Runtime Node 20 for tinymce-clean-server ─────────────────────
-  # The bundled `node-config` npm package calls `util.isRegExp` which was
-  # removed in Node 22+. The upstream module uses `pkgs.nodejs` (currently
-  # 24). Pure-JS deps are portable across node versions, so a runtime-only
-  # swap suffices for tinymce. Do NOT override `pkgs.nodejs` at build time
-  # — that invalidates `dataserverPkg` which then needs network to run
-  # `composer install` and fails in the nix sandbox.
-  systemd.services.zotero-selfhost-tinymce.serviceConfig.ExecStart =
-    lib.mkForce "${pkgs.nodejs_20}/bin/node /var/lib/zotero-selfhost/runtime/tinymce-clean-server/server.js";
-
-  # ── 2. Stream-server: replace `uws` with `ws` ──────────────────────
-  # The upstream `zotero/stream-server` depends on `uws` (µWebSockets), an
-  # abandoned native module with no prebuilt binaries for modern Node and
-  # source that no longer compiles. We maintain a hand-patched copy at
-  # /var/lib/zotero-stream-server-overlay/ (see "Manual setup steps" for
-  # how to build it). ExecStartPre rsyncs the overlay over the runtime
-  # dir on every start so the upstream prepare's broken `npm ci` for uws
-  # is never observed.
-  systemd.services.zotero-selfhost-stream.serviceConfig.ExecStartPre =
-    lib.mkForce (pkgs.writeShellScript "zotero-stream-overlay-prepare" ''
-      set -euo pipefail
-      ${pkgs.coreutils}/bin/mkdir -p /var/lib/zotero-selfhost/runtime/stream-server
-      ${pkgs.rsync}/bin/rsync -a --delete \
-        /var/lib/zotero-stream-server-overlay/ \
-        /var/lib/zotero-selfhost/runtime/stream-server/
-    '');
-  systemd.services.zotero-selfhost-stream.serviceConfig.ExecStart =
-    lib.mkForce "${pkgs.nodejs_20}/bin/node /var/lib/zotero-selfhost/runtime/stream-server/index.js";
-
-  # ── 3. Dataserver php: include_path + auto_prepend_file ─────────────
-  # The upstream `php` build is missing two settings the dataserver
-  # depends on, and the upstream `php -S` ExecStart doesn't pass them:
-  #   - include_path: htdocs/index.php does `require('config/routes.inc.php')`
-  #     and PHP can't find include/config/routes.inc.php without it.
-  #   - auto_prepend_file: htdocs/index.php uses Z_ENV_CONTROLLER_PATH and
-  #     other constants defined in include/header.inc.php but never
-  #     explicitly includes header.inc.php. The upstream Apache config
-  #     auto-prepends it; `php -S` doesn't unless the ini says so.
-  # Both must be set or PHP returns silent HTTP 500 (display_errors=Off,
-  # stderr swallowed by `php -S`). Override ExecStart with a buildEnv
-  # that adds both.
-  systemd.services.zotero-selfhost.serviceConfig.ExecStart =
-    let
-      zoteroPhp = pkgs.php84.buildEnv {
-        extensions = ({ enabled, all }: enabled ++ (with all; [ curl intl mbstring mysqli redis memcached ]));
-        extraConfig = ''
-          memory_limit = 1G
-          max_execution_time = 300
-          short_open_tag = On
-          display_errors = Off
-          error_reporting = E_ALL & ~E_NOTICE & ~E_STRICT & ~E_DEPRECATED
-          include_path = ".:/var/lib/zotero-selfhost/runtime/dataserver/htdocs:/var/lib/zotero-selfhost/runtime/dataserver/include"
-          auto_prepend_file = "/var/lib/zotero-selfhost/runtime/dataserver/include/header.inc.php"
-        '';
-      };
-    in
-    lib.mkForce "${zoteroPhp}/bin/php -S 127.0.0.1:${toString config.services.zotero-selfhost.listenPort} -t /var/lib/zotero-selfhost/runtime/dataserver/htdocs /var/lib/zotero-selfhost/runtime/dataserver/htdocs/index.php";
-
-  # ── 4. Dataserver prepare: Zend + zotero-schema overlay + dbconnect sed ─
-  # Three things the upstream prepare misses:
-  # (a) Zend Framework 1 — `htdocs/Zend/` is empty (the ZF1 archive in
-  #     src/patches/dataserver/Zend.tar.gz is extracted by docker
-  #     utils/patch.sh but the nix dataserverPkg installPhase skips it).
-  #     Stash Zend.tar.gz at /var/lib/zotero-dataserver-extras/ (see
-  #     "Manual setup steps") and we tar -x it on every start.
-  # (b) zotero-schema — htdocs/zotero-schema/ is a git submodule of the
-  #     dataserver source, but pkgs.fetchFromGitHub doesn't fetch
-  #     submodules. Without schema.json the dataserver throws "Locales
-  #     not available" → silent HTTP 500 on /itemTypes etc.
-  # (c) dbconnect.inc.php uses 'root' as the mysql user even when
-  #     services.zotero-selfhost.mysql.user is set — because our mkForce
-  #     of ExecStartPre below removes the upstream prepare from the
-  #     system closure, so its writeDataserverConfig dependency doesn't
-  #     get rebuilt either. We sed-patch the rendered file as a workaround.
-  # MUST use `tar --use-compress-program=gzip` — bare `tar -xzf` fails
-  # because the systemd unit's PATH has no `gzip` and gnutar tries to
-  # exec it.
-  systemd.services.zotero-selfhost.serviceConfig.ExecStartPre =
-    lib.mkForce (pkgs.writeShellScript "zotero-dataserver-prepare-with-extras" ''
-      set -euo pipefail
-      # Glob for the upstream prepare script. There should normally be
-      # exactly one matching path; pick the most recently built if
-      # multiple exist.
-      upstream_prepare=$(${pkgs.coreutils}/bin/ls -1dt /nix/store/*-zotero-dataserver-prepare 2>/dev/null | ${pkgs.coreutils}/bin/head -n1)
-      if [ -z "$upstream_prepare" ]; then
-        echo "FATAL: no zotero-dataserver-prepare in /nix/store" >&2
-        exit 1
-      fi
-      "$upstream_prepare"
-
-      # Overlay Zend Framework 1
-      ${pkgs.gnutar}/bin/tar \
-        --use-compress-program=${pkgs.gzip}/bin/gzip \
-        -xf /var/lib/zotero-dataserver-extras/Zend.tar.gz \
-        -C /var/lib/zotero-selfhost/runtime/dataserver/include/
-
-      # Overlay zotero-schema/schema.json
-      ${pkgs.coreutils}/bin/mkdir -p \
-        /var/lib/zotero-selfhost/runtime/dataserver/htdocs/zotero-schema
-      ${pkgs.coreutils}/bin/cp \
-        /var/lib/zotero-dataserver-extras/zotero-schema/schema.json \
-        /var/lib/zotero-selfhost/runtime/dataserver/htdocs/zotero-schema/schema.json
-
-      # Patch dbconnect.inc.php to use the `zotero` mysql user
-      ${pkgs.gnused}/bin/sed -i \
-        "s/\\\$user = 'root';/\$user = 'zotero';/g" \
-        /var/lib/zotero-selfhost/runtime/dataserver/include/config/dbconnect.inc.php
-    '');
-
-  # ── 5. (Optional) Web library SPA at /library/ + basic auth ─────────
-  # The upstream module deploys ONLY the dataserver, stream-server, and
-  # tinymce-clean-server — there's no browsable web UI. We add the
-  # zotero/web-library SPA out of band; see "Adding the web library
-  # frontend" below for the build steps. The two locations below assume
-  # you've put the build at /var/lib/zotero-web-library-root/library/
-  # and an htpasswd file at /etc/nginx/htpasswd.zotero-library.
-  services.nginx.virtualHosts."zotero.example.com".locations = {
-    "/library/" = {
-      root = "/var/lib/zotero-web-library-root";
-      tryFiles = "$uri $uri/ /library/index.html =404";
-      basicAuthFile = "/etc/nginx/htpasswd.zotero-library";
-    };
-    "/static/web-library/" = {
-      alias = "/var/lib/zotero-web-library-root/library/static/web-library/";
-      basicAuthFile = "/etc/nginx/htpasswd.zotero-library";
-    };
-    # Redirect bare https://zotero.example.com/ → /library/
-    # `= /` is nginx's exact-match modifier so this only fires for GET /
-    # and not /users/..., /itemTypes, /library/..., etc.
-    "= /" = {
-      return = "302 /library/";
-    };
-  };
-}
-```
-
-### Manual setup steps
-
-These can't be expressed cleanly as nix module options (yet). Run them
-once, after `nixos-rebuild switch` brings the services up for the first
-time.
-
-#### 1. Pre-create runtime working directories
-
-The upstream module's `WorkingDirectory=/var/lib/zotero-selfhost/runtime/{dataserver/htdocs,tinymce-clean-server,stream-server}`
-is checked by systemd **before** `ExecStartPre` runs, so the first start
-after a clean state hits a chicken-and-egg failure. Create them once:
-
-```sh
-sudo mkdir -p /var/lib/zotero-selfhost/runtime/dataserver/htdocs \
-              /var/lib/zotero-selfhost/runtime/tinymce-clean-server \
-              /var/lib/zotero-selfhost/runtime/stream-server
-sudo chown -R zotero:zotero /var/lib/zotero-selfhost/runtime
-```
-
-#### 2. Encrypt the sops secrets file
+#### 1. Encrypt the SOPS secrets file
 
 The `services.zotero-selfhost.sopsFile` path **must** point to a real
 sops/age-encrypted file. If you put plaintext YAML there, sops-nix
-activation fails with `failed to decrypt: sops metadata not found` and
-the dataserver never starts. Encrypt with the same age recipient your
-host uses:
+activation fails with `failed to decrypt: sops metadata not found`
+and the dataserver never starts. Encrypt with the same age recipient
+your host uses:
 
 ```sh
 sops --age age1<your-recipient> -e -i /data/zotero/zotero-selfhost.yaml
@@ -354,12 +163,13 @@ sops --age age1<your-recipient> -e -i /data/zotero/zotero-selfhost.yaml
 The required keys are listed in the SOPS keys table earlier in this
 README.
 
-#### 3. Create the `zotero` MySQL user
+#### 2. Create the `zotero` MariaDB user
 
-The init script and dataserver both connect to MariaDB over TCP, but
-NixOS's default MariaDB has `root` locked to `unix_socket` auth, so TCP
-password auth fails with "Access denied". Use a dedicated user with the
-password from your sops file:
+NixOS's default MariaDB has `root` locked to `unix_socket` auth, so
+the dataserver and `zotero-selfhost-init` (which both connect over
+TCP) can't authenticate as root. Create a dedicated user with the
+password from the sops file and grant it `ALL PRIVILEGES` (the init
+script needs `CREATE`/`DROP DATABASE`):
 
 ```sh
 MYSQL_PW=$(sops -d /data/zotero/zotero-selfhost.yaml | yq -r '."zotero-selfhost"."mysql-password"')
@@ -372,147 +182,43 @@ FLUSH PRIVILEGES;
 EOF
 ```
 
-(`GRANT ALL ON *.*` is needed because the init script runs `CREATE`/`DROP DATABASE`.)
+Then set `services.zotero-selfhost.mysql.user = "zotero";` in your
+flake config.
 
-#### 4. Stash Zend.tar.gz and zotero-schema/schema.json
-
-The dataserver's prepare overlay (override #4 above) reads two files
-from `/var/lib/zotero-dataserver-extras/`. Both come from upstream but
-aren't deployed by the nix module:
+#### 3. Run the bootstrap
 
 ```sh
-sudo mkdir -p /var/lib/zotero-dataserver-extras/zotero-schema
-
-# Zend Framework 1 — bundled in this repo
-sudo cp src/patches/dataserver/Zend.tar.gz /var/lib/zotero-dataserver-extras/
-
-# zotero-schema/schema.json — clone from upstream
-git clone https://github.com/zotero/zotero-schema.git /tmp/zotero-schema
-sudo cp /tmp/zotero-schema/schema.json /var/lib/zotero-dataserver-extras/zotero-schema/
+sudo zotero-selfhost-init
 ```
 
-#### 5. Bootstrap the databases
-
-The shipped `zotero-selfhost-init` (the binary the NixOS module installs)
-**does not work as-shipped** against MariaDB 11.4 + the current
-`zotero/dataserver` schema. Failures, in order:
-
-1. `SET @@global.innodb_large_prefix = 1` — variable was removed in
-   MariaDB 10.5+. Skip; DYNAMIC row format is the default now.
-2. `INSERT INTO libraries VALUES (1, 'user', CURRENT_TIMESTAMP, 0, 1)` —
-   schema has 6 cols (libraryID, libraryType, lastUpdated, version,
-   shardID, **hasData**), upstream insert provides 5.
-3. `INSERT INTO users VALUES (1, 1, '$user', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)`
-   in zotero_master — schema has 3 cols (userID, libraryID, username),
-   upstream provides 5.
-4. `INSERT INTO shardLibraries VALUES (1, 'user', CURRENT_TIMESTAMP, 0)` —
-   schema has 5 cols (libraryID, libraryType, lastUpdated, version,
-   **storageUsage**), upstream provides 4.
-
-Fixed init script (drop into `/var/lib/zotero-dataserver-extras/`):
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-read_secret() { tr -d '\n' < "$1"; }
-sql_escape() { printf '%s' "$1" | perl -pe 's/\x27/\x27\x27/g'; }
-MYSQL_PWD="$(read_secret /run/secrets/zotero-selfhost/mysql-password)"
-export MYSQL_PWD
-misc=$(ls -1d /nix/store/*-zotero-selfhost-dataserver-git/share/zotero-dataserver/misc | head -n1)
-www_sql=$(ls -1 /nix/store/*-www.sql | head -n1)
-superuser_password_sql="$(sql_escape "$(read_secret /run/secrets/zotero-selfhost/superuser-password)")"
-superuser_name_sql="$(sql_escape admin)"
-
-mysql_base() {
-  /run/current-system/sw/bin/mariadb -h 127.0.0.1 -P 3306 -u zotero "$@"
-}
-
-# innodb_large_prefix removed in MariaDB 10.5+
-echo 'set global sql_mode = "";' | mysql_base
-
-for db in zotero_master zotero_shard_1 zotero_shard_2 zotero_ids zotero_www; do
-  echo "DROP DATABASE IF EXISTS $db" | mysql_base
-  echo "CREATE DATABASE $db" | mysql_base
-done
-
-mysql_base zotero_master < "$misc/master.sql"
-mysql_base zotero_master < "$misc/coredata.sql"
-echo "INSERT INTO shardHosts VALUES (1, '127.0.0.1', 3306, 'up');" | mysql_base zotero_master
-echo "INSERT INTO shards VALUES (1, 1, 'zotero_shard_1', 'up', '1');" | mysql_base zotero_master
-echo "INSERT INTO shards VALUES (2, 1, 'zotero_shard_2', 'up', '1');" | mysql_base zotero_master
-echo "INSERT INTO libraries (libraryID, libraryType, lastUpdated, version, shardID, hasData) VALUES (1, 'user', CURRENT_TIMESTAMP, 0, 1, 0)" | mysql_base zotero_master
-echo "INSERT INTO libraries (libraryID, libraryType, lastUpdated, version, shardID, hasData) VALUES (2, 'group', CURRENT_TIMESTAMP, 0, 2, 0)" | mysql_base zotero_master
-echo "INSERT INTO users (userID, libraryID, username) VALUES (1, 1, '$superuser_name_sql')" | mysql_base zotero_master
-echo "INSERT INTO groups VALUES (1, 2, 'Shared', 'shared', 'Private', 'members', 'all', 'members', \"\", \"\", 0, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, 1)" | mysql_base zotero_master
-echo "INSERT INTO groupUsers VALUES (1, 1, 'owner', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)" | mysql_base zotero_master
-
-mysql_base zotero_www < "$www_sql"
-echo "INSERT INTO users VALUES (1, '$superuser_name_sql', MD5('$superuser_password_sql'), 'normal')" | mysql_base zotero_www
-echo "INSERT INTO users_email (userID, email) VALUES (1, 'admin@zotero.org')" | mysql_base zotero_www
-echo "INSERT INTO storage_institutions (institutionID, domain, storageQuota) VALUES (1, 'zotero.org', 10000)" | mysql_base zotero_www
-echo "INSERT INTO storage_institution_email (institutionID, email) VALUES (1, 'contact@zotero.org')" | mysql_base zotero_www
-
-for shard in zotero_shard_1 zotero_shard_2; do
-  mysql_base "$shard" < "$misc/shard.sql"
-  mysql_base "$shard" < "$misc/triggers.sql"
-done
-echo "INSERT INTO shardLibraries (libraryID, libraryType, lastUpdated, version, storageUsage) VALUES (1, 'user', CURRENT_TIMESTAMP, 0, 0)" | mysql_base zotero_shard_1
-echo "INSERT INTO shardLibraries (libraryID, libraryType, lastUpdated, version, storageUsage) VALUES (2, 'group', CURRENT_TIMESTAMP, 0, 0)" | mysql_base zotero_shard_2
-mysql_base zotero_ids < "$misc/ids.sql"
-
-echo "DB init OK"
-```
-
-Run it once:
-
-```sh
-sudo bash /var/lib/zotero-dataserver-extras/zotero-init-fixed.sh
-```
+This:
+- creates and seeds all five `zotero_*` databases
+- adds a `validated` column to `zotero_www.users_email` (required by
+  `Storage::getInstitutionalUserQuota` for file uploads)
+- runs `admin/schema_update` to ingest the current `schema.json`
+  mappings into the `fields`/`creatorTypes`/`itemTypes` tables (without
+  this, write operations fail with "Field 'X' from schema N not found")
+- creates the minio bucket(s) if `services.zotero-selfhost.s3.createBuckets`
+  is true
 
 It DROPs and recreates all five `zotero_*` dbs, so it's idempotent for
-fresh installs but **destructive for live data** — never run against a
-populated dataserver.
+fresh installs but **destructive for live data** — never re-run against
+a populated dataserver.
 
-#### 6. Ingest the schema into the DB tables
+#### 4. (Optional) Restart minio if you encrypted the secrets after first boot
 
-After step 5 the `fields`, `creatorTypes`, `itemTypes`, `itemTypeFields`,
-`baseFieldMappings`, and `itemTypeCreatorTypes` tables are pinned to
-whatever `coredata.sql` shipped (typically schema ~32). Recent schema
-versions add fields like `eventPlace`, `citationKey`, `dataset` itemType,
-etc. Without ingesting them, write operations fail with `Field 'X' from
-schema N not found in ItemFields.inc.php:222`.
+If your minio service started before the sops secrets file was
+encrypted, the `MINIO_ROOT_USER` / `MINIO_ROOT_PASSWORD` environment
+variables will be empty in the running process and minio will be
+using its default `minioadmin` credentials instead of yours.
+`sudo systemctl restart zotero-selfhost-minio` to fix.
 
-The dataserver has an `admin/schema_update` PHP script that ingests
-schema.json. Three gotchas:
+#### 5. (Optional) Create an API key for the web library
 
-1. **It collides with our `auto_prepend_file` override** — pass
-   `-d auto_prepend_file=` to disable for this invocation only,
-   otherwise `header.inc.php` gets included twice and you get a fatal
-   `Cannot redeclare zotero_autoload`.
-2. **It short-circuits if `settings.schemaVersion >= file version`**.
-   On first run there's no row so this doesn't bite, but if you ever
-   manually set the version (or already ran it with an older schema),
-   `DELETE FROM zotero_master.settings WHERE name='schemaVersion'`
-   first.
-3. **Memcached caches the version for 60s** — restart memcached after
-   any DB version change.
-
-```sh
-sudo mysql -u zotero zotero_master \
-  -e "DELETE FROM settings WHERE name='schemaVersion'"
-sudo systemctl restart memcached
-PHP=$(sudo systemctl cat zotero-selfhost.service | grep '^ExecStart=' | awk '{print $1}' | sed 's|^ExecStart=||')
-cd /var/lib/zotero-selfhost/runtime/dataserver/admin
-sudo -u zotero "$PHP" -d "auto_prepend_file=" schema_update
-```
-
-Re-run after every `schema.json` refresh.
-
-#### 7. Create an API key for the web library (optional, only needed if you're using the SPA)
-
-Generate a 24-char alphanumeric API key, insert it into
-`zotero_master.keys` for user 1 (admin) with library-wide perms, and
-remember it for the web library build (step 8).
+Only needed if you're going to deploy the SPA at `/library/` (next
+section). Generate a 24-char alphanumeric key and insert it into
+`zotero_master.keys` for `userID = 1` (admin) with library-wide
+permissions:
 
 ```sh
 KEY=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)
@@ -531,6 +237,70 @@ sudo systemctl restart memcached
 **Note:** `libraryID = 1` (admin's user library), **NOT** `libraryID = 0`
 — the latter means "all groups", not "all libraries", and the dataserver
 will return a misleading bare 403 with no error detail in logs.
+
+### Remaining out-of-band hack: stream-server uws→ws
+
+The upstream `zotero/stream-server` repo depends on `uws`
+(µWebSockets) `10.148.1`, an abandoned native module with no prebuilt
+binaries for modern Node and source that no longer compiles against
+modern Node ABIs. The NixOS module's `streamServerNodeDeps` FOD will
+fail (or silently fall back to a non-working stub) on any reasonably
+modern host.
+
+**Workaround:** maintain a hand-patched copy of the stream-server
+source at a stable path (e.g. `/var/lib/zotero-stream-server-overlay/`)
+with `uws` replaced by `ws ^7.5.10`. The required source patches are
+small:
+
+```diff
+--- a/connections.js
++++ b/connections.js
+@@ -27,1 +27,1 @@
+-var WebSocket = require('uws');
++var WebSocket = require('ws');
+
+--- a/server.js
++++ b/server.js
+@@ -635,1 +635,1 @@
+-		var WebSocketServer = require('uws').Server;
++		var WebSocketServer = require('ws').Server;
+@@ -649,3 +650,7 @@
+-		wss.on('connection', function (ws) {
++		// `ws` v3+ removed `upgradeReq`; stash req from the second arg
++		wss.on('connection', function (ws, req) {
++			ws.upgradeReq = req;
+ 			var remoteAddress = ws._socket.remoteAddress;
+ 			var xForwardedFor = ws.upgradeReq.headers['x-forwarded-for'];
+
+--- a/package.json
++++ b/package.json
+@@
+-    "uws": "10.148.1"
++    "ws": "^7.5.10"
+```
+
+After patching, `npm install --omit=dev` to populate `node_modules`,
+then drop the whole tree at `/var/lib/zotero-stream-server-overlay/`
+(owned by `zotero:zotero`) and override the systemd unit's
+`ExecStartPre` to rsync the overlay over the runtime dir on each
+start:
+
+```nix
+systemd.services.zotero-selfhost-stream.serviceConfig.ExecStartPre =
+  lib.mkForce (pkgs.writeShellScript "zotero-stream-overlay-prepare" ''
+    set -euo pipefail
+    ${pkgs.coreutils}/bin/mkdir -p /var/lib/zotero-selfhost/runtime/stream-server
+    ${pkgs.rsync}/bin/rsync -a --delete \
+      /var/lib/zotero-stream-server-overlay/ \
+      /var/lib/zotero-selfhost/runtime/stream-server/
+  '');
+```
+
+The proper long-term fix is to either patch the upstream
+`zotero/stream-server` source and replace `streamServerSrc`, or open
+a PR upstream. The stream server is only used for realtime
+notifications; the dataserver, web library, and Zotero clients all
+work fine without it (clients fall back to polling).
 
 ### Adding the web library frontend
 
