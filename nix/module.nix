@@ -354,6 +354,48 @@ let
         -e "s|export const streamingApiUrl = 'wss://stream.zotero.org/'|export const streamingApiUrl = 'wss://${cfg.webLibrary.hostname}/stream/'|" \
         src/js/constants/defaults.js
 
+      # Move the desktop/touch boundary from 992px down to 768px.
+      #
+      # Upstream treats the `sm` band (768-991px) as "touch or small": the
+      # item table is swapped for the touch list and the react-dnd
+      # connectors are skipped entirely (component/libraries/node.jsx,
+      # `if(!isTouchOrSmall)`), so the collections sidebar is visible but
+      # silently refuses every drop. Any window under 992 CSS px hits this,
+      # including a wide window at 125%+ browser zoom.
+      #
+      # The boundary is declared twice -- once in JS (reducers/device.js)
+      # and once in SCSS ($grid-breakpoints) -- and BOTH must move together.
+      # Relaxing only the JS gate renders desktop components at a width the
+      # stylesheet still styles for touch: .tag-selector's entire layout
+      # lives inside `mouse-and-bp-up(md)`, so at `sm` it loses its height
+      # constraint, grows to ~2600px and covers the collection tree, which
+      # swallows the drag. 421 rules across 46 stylesheets share that
+      # assumption, so we move the boundary rather than override the rules.
+      #
+      # Setting md's floor to 768 collapses `sm` to an empty range: every
+      # existing rule keeps working, it just triggers at 768 instead of 992.
+      # Real touch devices are unaffected -- mouse-and-bp-up is scoped to
+      # `html:not(.touch)` and touch-or-bp-down also fires under `html.touch`,
+      # so pointer type, not width, still governs there.
+      ${pkgs.gnused}/bin/sed -i \
+        -e "s|sm: width >= 768 && width < 992,|sm: width >= 768 \&\& width < 768, // collapsed: md now starts at 768|" \
+        -e "s|md: width >= 992 && width < 1200,|md: width >= 768 \&\& width < 1200,|" \
+        src/js/reducers/device.js
+      ${pkgs.gnused}/bin/sed -i \
+        -e "s|md: 992px,|md: 768px,|" \
+        src/scss/abstracts/_variables.scss
+
+      # Fail loudly rather than shipping a silently unpatched bundle.
+      grep -q "md: width >= 768 && width < 1200," src/js/reducers/device.js \
+        || { echo "ERROR: device.js md breakpoint patch did not apply"; exit 1; }
+      grep -q "sm: width >= 768 && width < 768," src/js/reducers/device.js \
+        || { echo "ERROR: device.js sm breakpoint patch did not apply"; exit 1; }
+      grep -q "md: 768px," src/scss/abstracts/_variables.scss \
+        || { echo "ERROR: scss \$grid-breakpoints patch did not apply"; exit 1; }
+      if grep -q "992" src/scss/abstracts/_variables.scss; then
+        echo "ERROR: 992px still present in \$grid-breakpoints"; exit 1
+      fi
+
       ${pkgs.gnused}/bin/sed -i \
         -e "s|http://zotero.org/|https://${cfg.webLibrary.hostname}/|g" \
         -e "s|https?://zotero.org/|https?://(?:zotero\\\\.org\\|${pkgs.lib.replaceStrings ["."] ["\\\\."] cfg.webLibrary.hostname})/|g" \
@@ -845,7 +887,14 @@ in {
         # determine the matching prebuild artifact URL on
         # zotero-download.s3.amazonaws.com.
         leaveDotGit = true;
-        sha256 = "sha256-x2tLXabG0A5Q0xDBuCjzNjvG2BJt1oB1fx0uxmGKM5Y=";
+        # NOTE: leaveDotGit makes this fetch non-reproducible -- the .git
+        # directory carries per-fetch timestamps, so every refetch yields a
+        # different NAR hash (six distinct outputs for this same rev already
+        # exist in the store, and the hash previously declared here no longer
+        # resolves). This pins the exact tree the running production build
+        # came from. A cold store will mismatch and need re-pinning from the
+        # "got:" line.
+        sha256 = "sha256-/RpaT47s7PvlxqxrCEIWyNOjqkhSzvysjasYYEnvUDs=";
         fetchSubmodules = true;
       };
       description = ''
@@ -864,7 +913,7 @@ in {
 
     webLibraryHash = mkOption {
       type = types.str;
-      default = "sha256-Cu2gPzmcPeRXSqhi7NNGF0LMASb/fP6JX+eLBx3rqxo=";
+      default = "sha256-Xhr57zOek+8ATf9k7X0Xh0eKICvsd4Xqg7+C2bvJYBU=";
       description = ''
         SRI hash of the built web-library bundle (the result of
         `npm install && npm run build`). The build is wrapped as a
