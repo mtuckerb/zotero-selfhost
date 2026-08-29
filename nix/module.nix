@@ -151,6 +151,7 @@ let
     ../src/patches/dataserver/0006-remove-storage-quota.patch
     ../src/patches/dataserver/0007-bump-upload-queue-limit.patch
     ../src/patches/dataserver/0008-drop-storage-class-standard-ia.patch
+    ../src/patches/dataserver/0009-typeless-search-for-opensearch.patch
   ];
 
   composerVendor = pkgs.stdenvNoCC.mkDerivation {
