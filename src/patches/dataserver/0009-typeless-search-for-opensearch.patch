@@ -1,0 +1,50 @@
+From 0000000000000000000000000000000000000009 Mon Sep 17 00:00:00 2001
+From: NixOS module overlay <noreply@example.com>
+Date: Fri, 28 Aug 2026 00:00:00 +0000
+Subject: [PATCH 9/9] Drop the mapping type from fulltext search for OpenSearch
+
+Zotero_FullText::searchInLibrary asks the Elasticsearch client for a
+typed search:
+
+    'index' => self::$elasticsearchType . "_index",
+    'type'  => self::$elasticsearchType,
+
+which the client turns into POST /item_fulltext_index/item_fulltext/_search.
+
+Mapping types were deprecated in Elasticsearch 7 and removed in
+Elasticsearch 8 / OpenSearch 2. Against OpenSearch there is no route for
+a URL with a type segment at all, so every fulltext search answers:
+
+    {"error":"no handler found for uri
+      [/item_fulltext_index/item_fulltext/_search] and method [POST]"}
+
+The dataserver logs this as an elasticsearch-php Connection.php error and
+returns nothing, so search-in-library silently finds no results while
+the rest of the API keeps working. It fires on every tag lookup the web
+library makes, which is why it dominates the service log.
+
+Dropping 'type' leaves POST /item_fulltext_index/_search, which is the
+modern form and is what both OpenSearch and Elasticsearch 8 expect. The
+index holds a single type, so nothing is lost by not naming it.
+
+Note this only makes the query well-formed. The index must also exist:
+misc/elasticsearch/bin/init creates it, and its final step issues a
+typed mapping PUT that fails the same way. Fold the mapping into the
+index-creation PUT before running it, or create the index by hand.
+---
+diff --git a/model/FullText.inc.php b/model/FullText.inc.php
+index 1234567..89abcde 100644
+--- a/model/FullText.inc.php
++++ b/model/FullText.inc.php
+@@ -248,7 +248,10 @@
+ 	public static function searchInLibrary($libraryID, $searchText) {
+ 		$params = [
+ 			'index' => self::$elasticsearchType . "_index",
+-			'type' => self::$elasticsearchType,
++			// Self-hosted: no 'type'. Mapping types were removed in
++			// OpenSearch 2 / Elasticsearch 8, and a typed search URL has
++			// no route there -- "no handler found for uri
++			// [/item_fulltext_index/item_fulltext/_search]".
+ 			'routing' => $libraryID,
+ 			'size' => 150,
+ 			"body" => [
