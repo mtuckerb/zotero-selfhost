@@ -1,0 +1,81 @@
+From 0000000000000000000000000000000000000010 Mon Sep 17 00:00:00 2001
+From: NixOS module overlay <noreply@example.com>
+Date: Fri, 28 Aug 2026 00:00:00 +0000
+Subject: [PATCH 10/10] Create the fulltext index with one typeless PUT
+
+misc/elasticsearch/bin/init cannot create item_fulltext_index on a
+self-hosted OpenSearch deployment. Three separate reasons:
+
+  - It curls -d @init.json and, via bin/update-settings, -d
+    @settings.json. Neither file exists: the repo ships them as
+    init.json-sample and settings.json-sample, expecting an operator to
+    copy them first. On a fresh checkout curl fails on the missing file.
+
+  - Its last step is PUT /item_fulltext_index/item_fulltext/_mapping.
+    Mapping types were removed in OpenSearch 2 / Elasticsearch 8, so
+    that URL has no route and answers 400 "no handler found for uri" --
+    the same fault patch 0009 fixes on the search side.
+
+  - init.json-sample sets number_of_replicas: 1, which leaves a
+    single-node cluster permanently yellow because the replica shard can
+    never be allocated.
+
+Collapse all of it into one typeless PUT with settings and mapping
+inlined, so the script works against a stock single-node cluster with no
+operator-supplied files. The mapping loses its "item_fulltext" wrapper
+because a typeless mapping has no type key to wrap it in.
+
+Without this the index simply does not exist, and a well-formed search
+answers index_not_found_exception rather than returning results. Run
+once per deployment:
+
+    misc/elasticsearch/bin/init 127.0.0.1
+---
+diff --git a/misc/elasticsearch/bin/init b/misc/elasticsearch/bin/init
+index 1234567..89abcde 100755
+--- a/misc/elasticsearch/bin/init
++++ b/misc/elasticsearch/bin/init
+@@ -13,9 +13,36 @@ HOST="$1"
+ ITEM_FULLTEXT_DIR=$DIR/item_fulltext
+ 
+-curl -XPUT "http://$HOST:9200/item_fulltext_index" -H "Content-Type: application/json" -d @$ITEM_FULLTEXT_DIR/init.json
+-echo
+-
+-$DIR/bin/update-settings $HOST
+-
+-curl -XPUT "http://$HOST:9200/item_fulltext_index/item_fulltext/_mapping" -H "Content-Type: application/json" -d @$ITEM_FULLTEXT_DIR/mapping.json
+-echo
++# Self-hosted: create the index in a single typeless PUT.
++#
++# The upstream flow does not work here for three reasons:
++#   - it reads init.json / settings.json, which ship only as
++#     *.json-sample, so curl -d @... fails on a fresh checkout;
++#   - its mapping PUT names a type (/item_fulltext_index/
++#     item_fulltext/_mapping), and mapping types were removed in
++#     OpenSearch 2 / Elasticsearch 8 -- no route, 400;
++#   - number_of_replicas: 1 leaves a single-node cluster yellow
++#     forever, since the replica can never be allocated.
++#
++# Settings and mapping are inlined so this runs against a stock
++# cluster with no operator-supplied files. Mapping is unwrapped:
++# typeless mappings have no type key.
++curl -XPUT "http://$HOST:9200/item_fulltext_index" -H "Content-Type: application/json" -d @- <<'JSON'
++{
++	"settings": {
++		"number_of_shards": 1,
++		"number_of_replicas": 0,
++		"refresh_interval": "5s",
++		"query.default_field": "content"
++	},
++	"mappings": {
++		"_source": { "enabled": false },
++		"_routing": { "required": true },
++		"dynamic": false,
++		"properties": {
++			"libraryID": { "type": "integer" },
++			"content": { "type": "text" }
++		}
++	}
++}
++JSON
++echo
