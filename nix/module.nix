@@ -493,7 +493,25 @@ let
       public static \$DEV_SITE = false;
       public static \$DEBUG_LOG = true;
 
-      public static \$BASE_URI = '${cfg.baseUri}';
+      # \$BASE_URI is NOT a network location -- it is the RDF identifier
+      # namespace Zotero uses for object URIs (relations, Atom feed ids), and
+      # every Zotero client hard-codes 'http://zotero.org/' when it emits them.
+      # The API's own input validation agrees: Zotero_Items::validateJSONItem()
+      # rejects any relation value that doesn't match
+      # ^http://zotero.org/(users|groups)/[0-9]+/(publications/)?items/[A-Z0-9]{8}\$
+      #
+      # Pointing it at cfg.baseUri broke related items: Zotero_URI::getURIObject()
+      # requires the incoming URI to start with \$BASE_URI, so resolving the
+      # 'http://zotero.org/...' URI a client sends threw "Invalid base URI" and
+      # every dc:relation write came back HTTP 500 ("An error occurred"). In the
+      # web library that surfaces as Related -> Add -> nothing happens. It also
+      # silently mangled stored subjects, since cfg.baseUri has no trailing
+      # slash and getUserURI() concatenates directly, yielding subjects like
+      # 'https://zotero.example.comusers/1/items/ABCD2345'.
+      #
+      # Fetchable URLs come from \$API_BASE_URI / \$WWW_BASE_URI, which stay
+      # on cfg.baseUri.
+      public static \$BASE_URI = 'http://zotero.org/';
       public static \$API_BASE_URI = '${cfg.baseUri}/';
       public static \$WWW_BASE_URI = '${cfg.baseUri}/';
 
@@ -962,6 +980,14 @@ in {
     baseUri = mkOption {
       type = types.str;
       default = "http://127.0.0.1:8080";
+      description = ''
+        Public origin the API and website are reached at, without a trailing
+        slash. Used for Z_CONFIG::\$API_BASE_URI and \$WWW_BASE_URI.
+
+        Deliberately NOT used for Z_CONFIG::\$BASE_URI, which is the RDF
+        identifier namespace for object URIs and must stay
+        'http://zotero.org/' -- see the comment in writeDataserverConfig.
+      '';
     };
 
     listenAddress = mkOption {
