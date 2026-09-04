@@ -514,6 +514,18 @@ The response should include `"success": { "0": "<8-char-key>" }`.
 
 ### Known limitations
 
+- **`index.html` hands out the `apiKey` unless the SPA root is gated.**
+  This module injects the key into `index.html`, and `index.html` is a
+  file. A deployment that authenticates the SPA at the application layer
+  does not cover it: an nginx `try_files $uri @upstream` only reaches the
+  upstream for paths that are NOT files, so `/` gets the login redirect
+  while `/index.html` is served straight off disk, key and all. Anyone
+  who fetches it can then use the key against the API, which is
+  deliberately open so desktop clients can sync. Set either
+  `webLibrary.basicAuthFile` or `webLibrary.authRequest` (with
+  `authErrorPage` for a redirect to your login page) on any deployment
+  reachable from the internet, and treat a key that was ever served this
+  way as compromised.
 - **The web library is single-user.** The `apiKey` is baked into the JS
   bundle at build time. Multi-user web access would require either
   multiple builds at different `/library/<user>/` paths (gated by

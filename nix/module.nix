@@ -1380,6 +1380,45 @@ in {
         '';
       };
 
+      authRequest = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "/_auth_validate";
+        description = ''
+          Optional nginx `auth_request` target guarding the SPA root.
+
+          Without it the SPA root is plain static file serving, and
+          `index.html` is a FILE. That matters more than it looks: the
+          config block this module injects into `index.html` contains
+          `apiKey`, so anything that serves that file hands out a working
+          library credential. A deployment that gates the SPA at the
+          application layer (its own login, a session cookie) does NOT
+          cover it -- a `try_files $uri ...` fallback only runs the
+          fallback for paths that are not files, so `/index.html` is
+          served directly and skips the gate that `/` goes through.
+
+          `basicAuthFile` closes this. Where the deployment authenticates
+          some other way, set this instead to an internal location
+          returning 2xx when authenticated and 401/403 otherwise.
+
+          Pair with `authErrorPage` to send rejected browsers somewhere
+          useful rather than a bare 401.
+        '';
+      };
+
+      authErrorPage = mkOption {
+        type = types.nullOr types.str;
+        default = null;
+        example = "@zs_login";
+        description = ''
+          Where to send a request `authRequest` rejected -- a named
+          location or a URI, emitted as `error_page 401 403 = <value>;`.
+          Typically a redirect to the deployment's login page, so a
+          browser with a lapsed session lands on the login form instead
+          of a bare 401. Ignored when `authRequest` is null.
+        '';
+      };
+
       readerTts = {
         enable = mkOption {
           type = types.bool;
@@ -1816,6 +1855,15 @@ in {
                 tryFiles = "$uri $uri/ /index.html";
               } // (lib.optionalAttrs (cfg.webLibrary.basicAuthFile != null) {
                 basicAuthFile = cfg.webLibrary.basicAuthFile;
+              }) // (lib.optionalAttrs (cfg.webLibrary.authRequest != null) {
+                # Covers index.html, which carries the injected apiKey and is
+                # a real file -- so a try_files fallback to an authenticating
+                # upstream never sees a request for it.
+                extraConfig = ''
+                  auth_request ${cfg.webLibrary.authRequest};
+                '' + lib.optionalString (cfg.webLibrary.authErrorPage != null) ''
+                  error_page 401 403 = ${cfg.webLibrary.authErrorPage};
+                '';
               }));
             } // readerTtsLocations;
           })
