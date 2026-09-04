@@ -21,6 +21,15 @@
    tag picker) keeps the containing block it has always had. */
 .ztts-bar {
 	flex: 0 0 auto;
+	/* Render last no matter where the node ends up in the DOM.
+	   The bar is appended to .reader-wrapper, but React owns that container and
+	   re-inserts the iframe when the reader swaps its spinner for the real view
+	   -- which lands the iframe AFTER the bar and puts the controls above the
+	   document. `order` is decided by the flex container, not by sibling order,
+	   so this holds however React reshuffles its own children. Where
+	   .reader-wrapper is not a flex container the property is simply ignored and
+	   the appended-last DOM position still applies. */
+	order: 1;
 	display: flex;
 	align-items: center;
 	gap: 8px;
