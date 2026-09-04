@@ -1388,6 +1388,36 @@ in {
         '';
       };
 
+      builtRoot = mkOption {
+        type = types.package;
+        readOnly = true;
+        description = ''
+          The web-library build this module actually serves, exported so a
+          host can reference it instead of pasting a `/nix/store/...` path.
+
+          Which derivation this is depends on `readerTts.enable` (the plain
+          SPA, or the SPA plus the read-aloud overlay), and it changes
+          whenever the `zotero-selfhost` input is bumped. A host that
+          customizes the vhost -- overriding `locations."/"`, or pointing its
+          own service at `index.html` -- needs the same path the module is
+          using, and hardcoding it means the two silently diverge on the next
+          bump: nginx then serves the new build at `/static/` and the stale
+          one everywhere else, so a change to `index.html` appears to deploy
+          and does nothing.
+
+          Read it instead:
+
+          ```nix
+          let root = config.services.zotero-selfhost.webLibrary.builtRoot; in {
+            services.nginx.virtualHosts."example.com".locations."/" =
+              lib.mkOverride 1 { root = "''${root}"; tryFiles = "$uri @spa"; };
+          }
+          ```
+
+          Read-only: it reports what the module built and cannot be set.
+        '';
+      };
+
       authRequest = mkOption {
         type = types.nullOr types.str;
         default = null;
@@ -1545,6 +1575,10 @@ in {
 
   config = mkIf cfg.enable (mkMerge [
     {
+    # Defined here rather than as an option default: a `default` would still
+    # let a host set the option, and this must report what the module built.
+    services.zotero-selfhost.webLibrary.builtRoot = webLibraryRoot;
+
     assertions = [
       {
         assertion = cfg.sopsFile != null;

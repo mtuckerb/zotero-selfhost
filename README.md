@@ -480,6 +480,29 @@ Playback speed is applied as the audio element's `playbackRate`, so
 changing it is instant and never re-synthesizes; the choice is remembered
 per browser in `localStorage`.
 
+#### Referencing the built SPA from host config (`builtRoot`)
+
+A host that customizes the vhost — overriding `locations."/"`, or pointing
+its own service at `index.html` — needs the same build the module serves.
+Read it from `webLibrary.builtRoot` rather than pasting a store path:
+
+```nix
+let root = config.services.zotero-selfhost.webLibrary.builtRoot; in {
+  services.nginx.virtualHosts."zotero.example.com".locations."/" =
+    lib.mkOverride 1 { root = "${root}"; tryFiles = "$uri @spa"; };
+}
+```
+
+The path changes whenever the `zotero-selfhost` input is bumped, and also
+depends on `readerTts.enable` (plain SPA vs. SPA plus the read-aloud
+overlay). Hardcoding it means the two silently diverge on the next bump:
+nginx serves the new build at `/static/web-library/` and the stale one
+everywhere else, so a change to `index.html` — a different voice, a new
+speed list — appears to deploy and does nothing.
+
+The option is read-only. Setting it fails the build rather than letting a
+stale value creep back in.
+
 ### Verification
 
 If everything is wired up, these should work:
