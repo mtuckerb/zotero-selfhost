@@ -259,6 +259,24 @@ let
     '';
   };
 
+  # Placeholder the build bakes in when the key comes from a secret file, so
+  # the real key never enters the nix store or git. Substituted at activation
+  # by zotero-selfhost-spa-index.
+  apiKeyPlaceholder = "@@ZOTERO_API_KEY@@";
+  effectiveApiKey =
+    if cfg.webLibrary.apiKeyFile != null then apiKeyPlaceholder
+    else if cfg.webLibrary.apiKey != null then cfg.webLibrary.apiKey
+    # Neither set: invalid, and the assertion below says so. Fall back to the
+    # placeholder rather than letting null propagate -- interpolating null dies
+    # with "cannot coerce null to a string" from somewhere deep in the nginx
+    # options, which buries the actual mistake.
+    else apiKeyPlaceholder;
+
+  # Where the rendered index.html lives when apiKeyFile is used. Group-readable
+  # by nginx only -- the whole point is to keep the key out of the
+  # world-readable store.
+  spaRuntimeDir = "/run/zotero-selfhost/www";
+
   # Python script that rewrites src/html/index.html in the web-library
   # build to substitute our user-config and menu-config blocks. Using
   # a separate file (rather than a heredoc) avoids the Nix `''` string
@@ -269,7 +287,7 @@ let
     src = open(path).read()
     user_slug = ${"\""}${cfg.webLibrary.userSlug}${"\""}
     user_id   = ${"\""}${cfg.webLibrary.userId}${"\""}
-    api_key   = ${"\""}${cfg.webLibrary.apiKey}${"\""}
+    api_key   = ${"\""}${effectiveApiKey}${"\""}
     new_config = (
         '<script type="application/json" id="zotero-web-library-config">\n'
         '\t\t{\n'
@@ -511,7 +529,7 @@ let
     # Re-apply this deployment's user config over the baked-in copy.
     python3 ${webLibraryHtmlPatcher} $out/index.html
 
-    grep -q '"apiKey": "${cfg.webLibrary.apiKey}"' $out/index.html \
+    grep -q '"apiKey": "${effectiveApiKey}"' $out/index.html \
       || { echo "ERROR: apiKey was not injected into index.html"; exit 1; }
   '' + lib.optionalString cfg.webLibrary.readerTts.enable ''
 
@@ -1349,8 +1367,38 @@ in {
         description = "Public hostname to serve the web library SPA on.";
       };
 
+      apiKeyFile = mkOption {
+        type = types.nullOr types.path;
+        default = null;
+        example = "/run/secrets/zotero-selfhost/web-library-api-key";
+        description = ''
+          Path to a file holding the web library's API key, read at
+          activation instead of baked into the build. Mutually exclusive
+          with `apiKey`; set exactly one.
+
+          Prefer this on anything you would not want the key committed to.
+          `apiKey` is an ordinary string, so it ends up in your
+          configuration's git history AND in a world-readable
+          `/nix/store` path -- readable by every local user, and by
+          anything that can fetch the built `index.html`. With
+          `apiKeyFile` the build bakes a placeholder, and a oneshot unit
+          renders the real `index.html` into ${spaRuntimeDir} (0750
+          nginx) before nginx starts. nginx is pointed there for the
+          index, so the key is never in the store.
+
+          Note what this does and does not buy. It protects the key from
+          git and from local users. It cannot protect it from the
+          browser: the SPA is a static client and needs a library
+          credential to make API calls, so anyone who can load the page
+          gets one. Gate the SPA (`authRequest` or `basicAuthFile`) --
+          that is the control that matters -- and prefer a deployment
+          that mints per-user keys if you have more than one user.
+        '';
+      };
+
       apiKey = mkOption {
-        type = types.str;
+        type = types.nullOr types.str;
+        default = null;
         example = "4YG74kzuoCxVsnSBdBrBauul";
         description = ''
           Zotero API key baked into the SPA build's index.html config
@@ -1365,6 +1413,9 @@ in {
           per-user OAuth proxy in front. For multi-user web access
           you'd need a separate build per user — the upstream SPA has
           no runtime apiKey injection.
+
+          Ends up in git and in a world-readable store path. Use
+          `apiKeyFile` instead where that matters.
         '';
       };
 
@@ -1595,6 +1646,15 @@ in {
     services.zotero-selfhost.webLibrary.builtRoot = webLibraryRoot;
 
     assertions = [
+      {
+        assertion = !cfg.webLibrary.enable
+          || ((cfg.webLibrary.apiKey == null) != (cfg.webLibrary.apiKeyFile == null));
+        message = ''
+          services.zotero-selfhost.webLibrary: set exactly one of `apiKey`
+          (plain string, ends up in git and the nix store) or `apiKeyFile`
+          (read at activation, kept out of both).
+        '';
+      }
       {
         assertion = cfg.sopsFile != null;
         message = "services.zotero-selfhost.sopsFile must be set so secrets are provided via sops-nix.";
@@ -1837,6 +1897,41 @@ in {
         };
       };
 
+      # Renders index.html with the real key into a directory only nginx can
+      # read. Ordered before nginx so the file exists on first start, and after
+      # sops-install-secrets so the key has actually been decrypted -- without
+      # that ordering a fresh boot renders an empty key and the SPA 403s until
+      # something restarts it.
+      systemd.services.zotero-selfhost-spa-index =
+        lib.mkIf (cfg.webLibrary.enable && cfg.webLibrary.apiKeyFile != null) {
+          description = "Render the Zotero web library index.html with its API key";
+          wantedBy = [ "multi-user.target" ];
+          before = [ "nginx.service" ];
+          after = [ "sops-install-secrets.service" ];
+          wants = [ "sops-install-secrets.service" ];
+          serviceConfig = { Type = "oneshot"; RemainAfterExit = true; };
+          script = ''
+            set -euo pipefail
+            key="$(tr -d '\n' < ${escapeShellArg cfg.webLibrary.apiKeyFile})"
+            if [ -z "$key" ]; then
+              echo "ERROR: ${cfg.webLibrary.apiKeyFile} is empty" >&2
+              exit 1
+            fi
+            install -d -o nginx -g nginx -m 0750 ${spaRuntimeDir}
+            # The key reaches sed via a variable, never argv, so it does not
+            # show up in the process list.
+            KEY="$key" ${pkgs.gnused}/bin/sed \
+              "s|${apiKeyPlaceholder}|$KEY|g" \
+              ${webLibraryRoot}/index.html > ${spaRuntimeDir}/index.html
+            chown nginx:nginx ${spaRuntimeDir}/index.html
+            chmod 0640 ${spaRuntimeDir}/index.html
+            if grep -q '${apiKeyPlaceholder}' ${spaRuntimeDir}/index.html; then
+              echo "ERROR: placeholder survived substitution" >&2
+              exit 1
+            fi
+          '';
+        };
+
       services.nginx = {
         enable = true;
         recommendedProxySettings = true;
@@ -1907,9 +2002,27 @@ in {
               # block above sets locations."/" to proxy_pass the
               # dataserver — when webLibrary.enable is true we replace
               # it entirely.
+              # With apiKeyFile the index must come from the runtime dir. A
+              # try_files fallback to /index.html would resolve against the
+              # store root and quietly serve the placeholder build, so the
+              # fallback goes to a named location instead.
+              "= /index.html" = mkIf (cfg.webLibrary.apiKeyFile != null) ({
+                root = spaRuntimeDir;
+              } // (lib.optionalAttrs (cfg.webLibrary.basicAuthFile != null) {
+                basicAuthFile = cfg.webLibrary.basicAuthFile;
+              }));
+
+              "@spaindex" = mkIf (cfg.webLibrary.apiKeyFile != null) {
+                root = spaRuntimeDir;
+                tryFiles = "/index.html =404";
+              };
+
               "/" = lib.mkForce ({
                 root = "${webLibraryRoot}";
-                tryFiles = "$uri $uri/ /index.html";
+                tryFiles =
+                  if cfg.webLibrary.apiKeyFile != null
+                  then "$uri $uri/ @spaindex"
+                  else "$uri $uri/ /index.html";
               } // (lib.optionalAttrs (cfg.webLibrary.basicAuthFile != null) {
                 basicAuthFile = cfg.webLibrary.basicAuthFile;
               }) // (lib.optionalAttrs (cfg.webLibrary.authRequest != null) {

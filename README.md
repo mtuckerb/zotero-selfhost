@@ -480,6 +480,32 @@ Playback speed is applied as the audio element's `playbackRate`, so
 changing it is instant and never re-synthesizes; the choice is remembered
 per browser in `localStorage`.
 
+#### Keeping the API key out of git and the store (`apiKeyFile`)
+
+`apiKey` is an ordinary string: it lands in your configuration's git
+history *and* in a world-readable `/nix/store` path. Use `apiKeyFile`
+instead where that matters — set exactly one of the two:
+
+```nix
+services.zotero-selfhost.webLibrary.apiKeyFile =
+  "/run/secrets/zotero-selfhost/web-library-api-key";
+```
+
+The build then bakes `@@ZOTERO_API_KEY@@` instead of a key, and a oneshot
+unit (`zotero-selfhost-spa-index`, ordered before nginx and after
+`sops-install-secrets`) renders the real `index.html` into
+`/run/zotero-selfhost/www` mode 0750 nginx. nginx serves the index from
+there. The SPA fallback becomes `try_files $uri $uri/ @spaindex` rather
+than `… /index.html`, because the latter resolves against the store root
+and would quietly serve the placeholder build.
+
+**What this does and does not buy.** It keeps the key out of git and away
+from local users. It cannot keep it from the browser: the SPA is a static
+client that needs a library credential to call the API, so anyone who can
+load the page gets one. Gating the SPA (`authRequest` or `basicAuthFile`)
+is the control that actually matters. If you have more than one user,
+prefer a front end that mints per-user keys over sharing one.
+
 #### Where per-deployment config is applied
 
 `webLibraryPkg` (the npm build) is a **fixed-output derivation** — its build
