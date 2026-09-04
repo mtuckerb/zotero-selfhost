@@ -16,6 +16,15 @@
       email = "admin@tuckerbradford.com";
     };
 
+    # Kokoro read-aloud in the web library reader. The URL must be
+    # reachable from the host running nginx, not from the browser --
+    # nginx proxies it at /reader-tts/ on the SPA's own origin.
+    # webLibrary.readerTts = {
+    #   enable = true;
+    #   kokoroUrl = "http://federalnix.lan:8890";
+    #   voice = "af_heart";
+    # };
+
     infrastructure = {
       enable = true;
       hostname = "zotero.tuckerbradford.com";

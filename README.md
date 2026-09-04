@@ -406,6 +406,61 @@ The `basicAuthFile` directives in the nginx override (override #5 above)
 already point at this path. Rebuild with `nixos-rebuild switch` and the
 SPA will require `admin` + the password you set.
 
+#### Read aloud in the reader (Kokoro TTS)
+
+`webLibrary.readerTts` adds text-to-speech to the reader: select text and
+press **Read selection**, or press **Read aloud** to read the whole
+attachment. Playback gets a transport bar — previous/next part, rewind and
+fast-forward, play/pause, a scrub bar, and a speed selector.
+
+```nix
+services.zotero-selfhost.webLibrary.readerTts = {
+  enable = true;
+  kokoroUrl = "http://federalnix.lan:8890";  # reachable from the nginx host
+  voice = "af_heart";
+};
+```
+
+nginx proxies Kokoro at `/reader-tts/` on the SPA's own vhost, so the
+browser only ever talks to one origin — no CORS, and the Kokoro server
+itself never has to be exposed. When `basicAuthFile` is set, the proxy is
+gated by it too; otherwise it would be an open synthesis endpoint for
+anyone who found the hostname.
+
+The path is `/reader-tts/` rather than `/tts/` because the dataserver
+already owns `/tts/*` for Zotero's own hosted read-aloud service
+(`/tts/voices`, `/tts/speak`, `/tts/credits`). That service is not usable
+on a self-host: it is a billing and caching layer that needs DynamoDB, an
+S3 cache bucket and CloudFront, and the actual voice backends are loaded
+from `model/tts/*.inc.php`, which does not exist in the open-source
+dataserver.
+
+*How it is wired.* `zotero/reader` is downloaded as a prebuilt zip during
+the web-library build, so there is no reader source tree here to patch.
+Instead an overlay script and stylesheet from `assets/reader-tts/` are
+layered onto the built SPA by a second derivation (`webLibraryWithTts`)
+and injected into `index.html`. That derivation is deliberately separate
+from `webLibraryPkg`: `webLibraryPkg` is fixed-output, so folding the
+overlay into it would mean re-pinning `webLibraryHash` on every edit to
+the JavaScript. The overlay reaches the reader's selection because the
+reader runs in a same-origin iframe
+(`/static/web-library/reader/reader.html`).
+
+*Reading a whole attachment needs indexed full text.* The reader renders
+pages lazily, so there is no complete document in the DOM to read; the
+overlay fetches `GET /users/<id>/items/<key>/fulltext` instead. That is
+populated by the desktop client's full-text indexing and sync, so an
+attachment the desktop client has never indexed reports "No indexed full
+text for this attachment". Reading a **selection** has no such
+requirement and works on any open document.
+
+Other options: `format` (default `mp3`), `seekStepSec` (default 15),
+`chunkMaxChars` (default 1500 — lower starts playing sooner and gives
+finer part granularity, higher means fewer seams), and `speeds`.
+Playback speed is applied as the audio element's `playbackRate`, so
+changing it is instant and never re-synthesizes; the choice is remembered
+per browser in `localStorage`.
+
 ### Verification
 
 If everything is wired up, these should work:
@@ -466,6 +521,17 @@ The response should include `"success": { "0": "<8-char-key>" }`.
 - **Pre-existing failing services on the example host** (e.g.
   `cliproxyapi-dashboard`, `ollama-model-loader`) are unrelated to
   zotero — ignore when triaging.
+- **Read-aloud reads whole documents only from the full-text index.**
+  See `webLibrary.readerTts` above: an attachment the desktop client has
+  not indexed and synced can only be read by selecting text. There is no
+  client-side PDF text extraction fallback.
+- **Read-aloud does not highlight the words being spoken.** Kokoro
+  returns no word timings, and the reader's PDF text layer is virtualized
+  (nodes are recycled as pages scroll out), so a highlight anchored to
+  them would drift and detach. The transport bar reports position within
+  the current part instead.
+- **Read-aloud is pinned to one voice per deployment.** `voice` is build
+  time configuration; there is no in-reader voice picker.
 
 *Available endpoints*:
 

@@ -448,6 +448,107 @@ let
     outputHash = cfg.webLibraryHash;
   };
 
+  # Runtime config for the read-aloud overlay, injected into index.html as a
+  # JSON block the same way upstream ships its own config blocks. Kept as data
+  # rather than baked into the script so changing a voice or a speed list does
+  # not mean editing JavaScript.
+  readerTtsConfig = builtins.toJSON {
+    enabled = true;
+    endpoint = "/reader-tts";
+    voice = cfg.webLibrary.readerTts.voice;
+    format = cfg.webLibrary.readerTts.format;
+    seekStepSec = cfg.webLibrary.readerTts.seekStepSec;
+    chunkMaxChars = cfg.webLibrary.readerTts.chunkMaxChars;
+    speeds = map (s: builtins.fromJSON s) cfg.webLibrary.readerTts.speeds;
+  };
+
+  # Python helper that injects the read-aloud stylesheet, config block and
+  # script into the built index.html, immediately before </head>.
+  readerTtsHtmlPatcher = pkgs.writeText "patch-index-html-tts.py" ''
+    import sys
+    path = sys.argv[1]
+    src = open(path).read()
+    marker = '<!-- zotero-reader-tts -->'
+    if marker in src:
+        sys.exit(0)
+    block = (
+        '\t' + marker + '\n'
+        '\t<link rel="stylesheet" href="/static/web-library/reader-tts.css">\n'
+        '\t<script type="application/json" id="zotero-reader-tts-config">\n'
+        '\t\t' + open(sys.argv[2]).read().strip() + '\n'
+        '\t</script>\n'
+        '\t<script src="/static/web-library/reader-tts.js" defer></script>\n'
+    )
+    if '</head>' not in src:
+        sys.stderr.write('ERROR: no </head> in index.html; cannot inject read-aloud\n')
+        sys.exit(1)
+    src = src.replace('</head>', block + '</head>', 1)
+    open(path, 'w').write(src)
+  '';
+
+  # The SPA plus the read-aloud overlay.
+  #
+  # Deliberately a SEPARATE derivation layered on top of webLibraryPkg rather
+  # than extra steps inside it: webLibraryPkg is fixed-output (it needs network
+  # access for npm, fonts and CSL styles), so anything added to it changes
+  # webLibraryHash. Editing reader-tts.js would then mean re-pinning that hash
+  # on every change. As an overlay the SPA build is untouched and its hash
+  # stays put.
+  webLibraryWithTts = pkgs.runCommand "zotero-web-library-tts" {
+    nativeBuildInputs = [ pkgs.python3 ];
+  } ''
+    cp -r ${webLibraryPkg} $out
+    chmod -R u+w $out
+
+    cp ${../assets/reader-tts/reader-tts.js} $out/static/web-library/reader-tts.js
+    cp ${../assets/reader-tts/reader-tts.css} $out/static/web-library/reader-tts.css
+
+    python3 ${readerTtsHtmlPatcher} $out/index.html \
+      ${pkgs.writeText "reader-tts-config.json" readerTtsConfig}
+
+    # Fail the build rather than shipping an SPA that silently lacks the
+    # overlay -- a missing <script> tag is invisible until someone opens the
+    # reader and wonders where the button went.
+    grep -q 'reader-tts.js' $out/index.html \
+      || { echo "ERROR: read-aloud script tag was not injected into index.html"; exit 1; }
+  '';
+
+  # What nginx serves at the SPA root.
+  webLibraryRoot =
+    if cfg.webLibrary.readerTts.enable then webLibraryWithTts else webLibraryPkg;
+
+  # nginx location that fronts Kokoro for the read-aloud overlay.
+  #
+  # The path is /reader-tts/ rather than the more obvious /tts/ because the
+  # dataserver already owns /tts/* -- that is Zotero's own hosted read-aloud
+  # service (/tts/voices, /tts/speak, /tts/credits, see
+  # include/config/routes.inc.php upstream), and those paths are already
+  # claimed by the API regex location above. Since a regex location beats a
+  # plain prefix location in nginx, a /tts/ block here would never be reached.
+  #
+  # Proxying on the SPA's own origin means the browser makes no cross-origin
+  # request (no CORS preflight, no second certificate) and the Kokoro server
+  # itself never has to be exposed. When the SPA is behind basic auth, so is
+  # this -- otherwise it would be an open synthesis endpoint for anyone who
+  # found the hostname.
+  readerTtsLocations = lib.optionalAttrs cfg.webLibrary.readerTts.enable {
+    "/reader-tts/" = {
+      proxyPass = "${cfg.webLibrary.readerTts.kokoroUrl}/";
+      extraConfig = ''
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        # Synthesizing a part takes seconds, not milliseconds; nginx's 60s
+        # default would cut off the slower ones.
+        proxy_read_timeout 300s;
+        proxy_send_timeout 300s;
+      '';
+    } // (lib.optionalAttrs (cfg.webLibrary.basicAuthFile != null) {
+      basicAuthFile = cfg.webLibrary.basicAuthFile;
+    });
+  };
+
   dataDir = cfg.stateDir;
   runtimeDir = "${cfg.stateDir}/runtime";
   dataserverRuntime = "${runtimeDir}/dataserver";
@@ -1272,6 +1373,94 @@ in {
           baked into the JS bundle.
         '';
       };
+
+      readerTts = {
+        enable = mkOption {
+          type = types.bool;
+          default = false;
+          description = ''
+            Add Kokoro read-aloud to the web library's reader: select
+            text to hear it, or read the whole attachment, with a
+            transport bar (play/pause, previous/next part, seek by
+            `seekStepSec`, scrub, and a speed selector).
+
+            This is an overlay script layered onto the built SPA, NOT a
+            patch to zotero/reader — the reader ships as a prebuilt zip
+            that the web-library build downloads, so there is no source
+            tree here to patch. It works because the reader runs in a
+            same-origin iframe, which the overlay can read selections
+            from directly.
+
+            Requires `kokoroUrl` to point at a reachable Kokoro server;
+            nginx proxies it at `/tts/` on the SPA vhost so the browser
+            only ever talks to the same origin (no CORS, and the Kokoro
+            server itself need not be exposed).
+
+            Whole-attachment reading uses the dataserver's full-text
+            index (GET /users/<id>/items/<key>/fulltext), so an
+            attachment only reads end-to-end once the desktop client
+            has indexed and synced its text. Selection reading has no
+            such requirement.
+          '';
+        };
+
+        kokoroUrl = mkOption {
+          type = types.str;
+          default = "http://127.0.0.1:8890";
+          example = "http://federalnix.lan:8890";
+          description = ''
+            Base URL of the Kokoro TTS server (the OpenAI-compatible
+            FastAPI one exposing /v1/audio/speech). nginx proxies
+            `/tts/` here, so it needs to be reachable from the host
+            running nginx, not from the browser.
+          '';
+        };
+
+        voice = mkOption {
+          type = types.str;
+          default = "af_heart";
+          description = "Kokoro voice id used for reader playback.";
+        };
+
+        format = mkOption {
+          type = types.enum [ "mp3" "wav" "opus" "flac" ];
+          default = "mp3";
+          description = ''
+            Audio format requested from Kokoro. mp3 is the safe default:
+            every browser decodes it, and the overlay buffers each part
+            whole, so the container needs no streaming support.
+          '';
+        };
+
+        seekStepSec = mkOption {
+          type = types.ints.positive;
+          default = 15;
+          description = "Seconds the rewind / fast-forward buttons move.";
+        };
+
+        chunkMaxChars = mkOption {
+          type = types.ints.positive;
+          default = 1500;
+          description = ''
+            Maximum characters per synthesized part. Lower values start
+            playing sooner and give finer previous/next-part granularity;
+            higher values mean fewer seams between parts. Each part is
+            synthesized whole before it plays, so this is the main knob
+            for time-to-first-audio.
+          '';
+        };
+
+        speeds = mkOption {
+          type = types.listOf types.str;
+          default = [ "0.75" "1" "1.25" "1.5" "1.75" "2" ];
+          description = ''
+            Playback speeds offered in the transport bar, as strings so
+            they survive Nix -> JSON without float formatting surprises.
+            Applied as the audio element's playbackRate, so changing
+            speed is instant and never re-synthesizes.
+          '';
+        };
+      };
     };
   };
 
@@ -1580,7 +1769,7 @@ in {
               # SPA static assets — index.html references these as
               # /static/web-library/... (root-relative).
               "/static/web-library/" = {
-                alias = "${webLibraryPkg}/static/web-library/";
+                alias = "${webLibraryRoot}/static/web-library/";
               } // (lib.optionalAttrs (cfg.webLibrary.basicAuthFile != null) {
                 basicAuthFile = cfg.webLibrary.basicAuthFile;
               });
@@ -1591,12 +1780,12 @@ in {
               # dataserver — when webLibrary.enable is true we replace
               # it entirely.
               "/" = lib.mkForce ({
-                root = "${webLibraryPkg}";
+                root = "${webLibraryRoot}";
                 tryFiles = "$uri $uri/ /index.html";
               } // (lib.optionalAttrs (cfg.webLibrary.basicAuthFile != null) {
                 basicAuthFile = cfg.webLibrary.basicAuthFile;
               }));
-            };
+            } // readerTtsLocations;
           })
         ];
         virtualHosts.${cfg.infrastructure.attachmentsHostname} = {
