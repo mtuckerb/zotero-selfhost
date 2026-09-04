@@ -423,9 +423,28 @@ services.zotero-selfhost.webLibrary.readerTts = {
 
 nginx proxies Kokoro at `/reader-tts/` on the SPA's own vhost, so the
 browser only ever talks to one origin — no CORS, and the Kokoro server
-itself never has to be exposed. When `basicAuthFile` is set, the proxy is
-gated by it too; otherwise it would be an open synthesis endpoint for
-anyone who found the hostname.
+itself never has to be exposed.
+
+**Gate it.** Synthesis is expensive, so on anything reachable from the
+internet an ungated `/reader-tts/` is free GPU for whoever finds the
+hostname. Two gates are available and they compose:
+
+- `basicAuthFile` — inherited from the SPA automatically when set.
+- `readerTts.authRequest` — an nginx `auth_request` target, for a
+  deployment that already authenticates some other way and does not want
+  a second password. Point it at an internal location returning 2xx when
+  authenticated and 401/403 otherwise; `/reader-tts/` then accepts
+  exactly the users that location accepts. The location is not defined
+  by this module — it belongs to whatever provides the session — so use
+  one that already exists on the vhost:
+
+  ```nix
+  services.zotero-selfhost.webLibrary.readerTts.authRequest = "/_auth_validate";
+  ```
+
+  The overlay sends credentials same-origin, so a session cookie rides
+  along; when the gate rejects a request the bar reports "Session
+  expired — reload the page to read aloud" rather than failing silently.
 
 The path is `/reader-tts/` rather than `/tts/` because the dataserver
 already owns `/tts/*` for Zotero's own hosted read-aloud service

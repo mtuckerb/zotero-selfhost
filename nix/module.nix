@@ -528,9 +528,13 @@ let
   #
   # Proxying on the SPA's own origin means the browser makes no cross-origin
   # request (no CORS preflight, no second certificate) and the Kokoro server
-  # itself never has to be exposed. When the SPA is behind basic auth, so is
-  # this -- otherwise it would be an open synthesis endpoint for anyone who
-  # found the hostname.
+  # itself never has to be exposed.
+  #
+  # Synthesis is expensive, so this must not be left open on a publicly
+  # reachable host. Two gates are available and they compose: `basicAuthFile`
+  # (inherited from the SPA) and `authRequest` (an existing nginx auth_request
+  # location, for a deployment that gates on a session cookie or SSO instead
+  # of a second password).
   readerTtsLocations = lib.optionalAttrs cfg.webLibrary.readerTts.enable {
     "/reader-tts/" = {
       proxyPass = "${cfg.webLibrary.readerTts.kokoroUrl}/";
@@ -543,6 +547,8 @@ let
         # default would cut off the slower ones.
         proxy_read_timeout 300s;
         proxy_send_timeout 300s;
+      '' + lib.optionalString (cfg.webLibrary.readerTts.authRequest != null) ''
+        auth_request ${cfg.webLibrary.readerTts.authRequest};
       '';
     } // (lib.optionalAttrs (cfg.webLibrary.basicAuthFile != null) {
       basicAuthFile = cfg.webLibrary.basicAuthFile;
@@ -1429,6 +1435,32 @@ in {
             Audio format requested from Kokoro. mp3 is the safe default:
             every browser decodes it, and the overlay buffers each part
             whole, so the container needs no streaming support.
+          '';
+        };
+
+        authRequest = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "/_auth_validate";
+          description = ''
+            Optional nginx `auth_request` target guarding `/reader-tts/`.
+
+            Synthesis is expensive, so on any deployment reachable from the
+            internet the endpoint needs a gate or it is free GPU for whoever
+            finds the hostname. `basicAuthFile` covers that when it is set,
+            but a deployment that authenticates the SPA some other way (a
+            session cookie, an SSO forward-auth) wants the gate it already
+            has rather than a second password.
+
+            Set this to an internal location that returns 2xx for an
+            authenticated request and 401/403 otherwise, and `/reader-tts/`
+            will accept exactly the users that location accepts. The location
+            itself is NOT defined here -- it belongs to whatever provides the
+            session -- so point this at one that already exists on the vhost.
+
+            Combines with `basicAuthFile`: set both and a request must satisfy
+            both. Leave null on a deployment where the whole vhost is already
+            behind basic auth or is not publicly reachable.
           '';
         };
 
