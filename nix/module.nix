@@ -538,11 +538,19 @@ let
   readerTtsLocations = lib.optionalAttrs cfg.webLibrary.readerTts.enable {
     "/reader-tts/" = {
       proxyPass = "${cfg.webLibrary.readerTts.kokoroUrl}/";
+      # Deliberately NO proxy_set_header for Host / X-Real-IP / X-Forwarded-*.
+      #
+      # This module sets services.nginx.recommendedProxySettings, which appends
+      # an include defining exactly those. nginx does not deduplicate
+      # proxy_set_header: declaring Host here as well makes it send TWO Host
+      # headers, and a request with a duplicate Host is malformed (RFC 7230
+      # 5.4). Kokoro is FastAPI behind uvicorn, whose h11 parser enforces that
+      # and answers `400 Invalid HTTP request received.` before FastAPI ever
+      # runs -- so every synthesis failed while a direct curl to the same
+      # endpoint succeeded. Other upstreams on the vhost (zotero-rs on hyper,
+      # the PHP dataserver) happen to tolerate the duplicate, which is why only
+      # read-aloud broke.
       extraConfig = ''
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
         # Synthesizing a part takes seconds, not milliseconds; nginx's 60s
         # default would cut off the slower ones.
         proxy_read_timeout 300s;
