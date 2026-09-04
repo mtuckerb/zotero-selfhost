@@ -344,6 +344,7 @@
 		var theRun = run;
 		theRun.index = index;
 		theRun.loading = true;
+		theRun.failed = null;
 		setPhase('loading');
 		renderMeta();
 		loadPart(theRun, index).then(function (url) {
@@ -376,6 +377,16 @@
 		}).catch(function (err) {
 			if (run !== theRun) return;
 			if (err && (err.name === 'AbortError' || err.message === 'cancelled')) return;
+			// Drop the previous part's clip. Left loaded, the element keeps it
+			// in its `ended` state and Play would replay THAT — the wrong part,
+			// under the failed part's label — after which `ended` would advance
+			// past the part that never played, losing it silently.
+			theRun.failed = index;
+			if (audio) {
+				audio.pause();
+				audio.removeAttribute('src');
+				audio.load();
+			}
 			setError(err && err.message ? err.message : 'TTS failed');
 		}).then(function () {
 			if (run === theRun && theRun.index === index) theRun.loading = false;
@@ -408,6 +419,8 @@
 			// Set by seekBy when a +/- step runs off the end of a part; applied
 			// once the part it lands in reports a duration.
 			pendingSeek: null,
+			// Index of a part whose synthesis failed, so Play can retry it.
+			failed: null,
 			controller: new AbortController(),
 			parts: chunks.map(function (t) {
 				return { text: t, url: null, pending: null };
@@ -421,7 +434,17 @@
 	// ---------------------------------------------------- transport controls
 
 	function togglePlay() {
-		if (!run || !audio || !audio.src) return;
+		if (!run) return;
+		// A part whose synthesis failed left nothing loaded. Play then means
+		// "try that part again" — the useful action after a transient Kokoro
+		// error — rather than doing nothing, or replaying a neighbouring part.
+		if (run.failed !== null) {
+			var retry = run.failed;
+			run.failed = null;
+			playPart(retry, true);
+			return;
+		}
+		if (!audio || !audio.src) return;
 		if (audio.paused) audio.play().catch(function () {});
 		else audio.pause();
 	}
@@ -610,8 +633,11 @@
 
 		group.appendChild(button('ztts-btn', 'Stop reading', ICONS.stop, stopRun));
 
+		// On the BAR, not in the transport group: an error raised before a run
+		// exists collapses the transport (see setError), and an error message
+		// inside the thing being hidden is no message at all.
 		ui.error = el('span', 'ztts-error');
-		group.appendChild(ui.error);
+		bar.appendChild(ui.error);
 
 		return bar;
 	}
