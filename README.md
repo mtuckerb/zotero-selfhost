@@ -473,6 +473,11 @@ attachment the desktop client has never indexed reports "No indexed full
 text for this attachment". Reading a **selection** has no such
 requirement and works on any open document.
 
+The voice control sits in the transport bar. Changing it re-synthesizes
+from the current position — unlike speed, which is `playbackRate` on audio
+already loaded and so applies instantly. The choice is remembered per
+browser in `localStorage`, the same as speed.
+
 Other options: `format` (default `mp3`), `seekStepSec` (default 15),
 `chunkMaxChars` (default 1500 — lower starts playing sooner and gives
 finer part granularity, higher means fewer seams), and `speeds`.
@@ -627,8 +632,11 @@ The response should include `"success": { "0": "<8-char-key>" }`.
   (nodes are recycled as pages scroll out), so a highlight anchored to
   them would drift and detach. The transport bar reports position within
   the current part instead.
-- **Read-aloud is pinned to one voice per deployment.** `voice` is build
-  time configuration; there is no in-reader voice picker.
+- **The read-aloud voice list comes from the running Kokoro server.** The
+  transport bar fetches `/reader-tts/v1/audio/voices` and groups the
+  result by the `<lang><gender>_` id prefix; `readerTts.voice` is only the
+  default for a browser that has not chosen one. If that request fails the
+  control still offers the configured voice, so read-aloud keeps working.
 
 *Available endpoints*:
 
