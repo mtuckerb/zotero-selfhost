@@ -257,6 +257,9 @@
 			playPart(run.index + 1, true);
 		});
 		audio.addEventListener('loadedmetadata', function () {
+			// Re-pin after the load algorithm has run, so the rate holds even
+			// if a browser restores it differently than the spec describes.
+			applyRate(audio);
 			applyPendingSeek();
 			syncScrubRange();
 		});
@@ -267,6 +270,22 @@
 			setError('Audio playback failed');
 		});
 		return audio;
+	}
+
+	/**
+	 * Pin the element's playback rate.
+	 *
+	 * Sets BOTH properties, deliberately. `load()` resets `playbackRate` to
+	 * `defaultPlaybackRate` as part of the media load algorithm, so a rate
+	 * assigned before a load is silently discarded — which made the chosen
+	 * speed apply only to the part it was changed on and revert to 1x on every
+	 * part after it, and on every later reading. `defaultPlaybackRate` is what
+	 * carries the choice across loads.
+	 */
+	function applyRate(el) {
+		if (!el) return;
+		el.defaultPlaybackRate = speed;
+		el.playbackRate = speed;
 	}
 
 	/** Drop a part's object URL once it can no longer be replayed. */
@@ -363,7 +382,7 @@
 			// never the one being revoked.
 			pruneParts(theRun, index);
 			a.src = url;
-			a.playbackRate = speed;
+			applyRate(a);
 			a.load();
 			if (!autoplay) {
 				theRun.loading = false;
@@ -528,7 +547,7 @@
 
 	function applySpeed(next) {
 		speed = clampSpeed(next);
-		if (audio) audio.playbackRate = speed;
+		applyRate(audio);
 		saveSpeed(speed);
 		if (ui.speed) ui.speed.value = String(speed);
 	}
