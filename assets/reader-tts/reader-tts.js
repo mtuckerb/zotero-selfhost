@@ -198,6 +198,11 @@
 				response_format: FORMAT,
 				speed: 1
 			}),
+			// The endpoint may sit behind an nginx auth_request gate that reads
+			// the deployment's session cookie. Same-origin is fetch's default,
+			// but state it: without the cookie such a gate answers 401 and no
+			// audio is ever produced.
+			credentials: 'same-origin',
 			signal: signal
 		}).then(function (response) {
 			if (!response.ok) {
@@ -208,7 +213,11 @@
 								? 'Kokoro is unreachable'
 								: response.status === 404
 									? 'TTS endpoint not configured'
-									: (body || 'TTS failed (HTTP ' + response.status + ')')
+									: (response.status === 401 || response.status === 403)
+										// An auth_request gate rejected us: the session
+										// behind it lapsed while the tab stayed open.
+										? 'Session expired — reload the page to read aloud'
+										: (body || 'TTS failed (HTTP ' + response.status + ')')
 						);
 					});
 			}
