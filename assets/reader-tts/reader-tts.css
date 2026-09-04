@@ -100,6 +100,7 @@
 	white-space: nowrap;
 }
 
+.ztts-voice,
 .ztts-speed {
 	height: 26px;
 	padding: 0 4px;
@@ -108,6 +109,12 @@
 	background: var(--material-background, #fff);
 	color: inherit;
 	font-size: 11px;
+}
+
+/* The voice list is long; give it room to show a name but keep it from
+   crowding out the scrub bar on a narrow reader. */
+.ztts-voice {
+	max-width: 11rem;
 }
 
 .ztts-error {

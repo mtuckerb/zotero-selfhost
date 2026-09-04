@@ -86,6 +86,7 @@
 		: 1500;
 
 	var SPEED_STORAGE_KEY = 'zotero-reader-tts-speed';
+	var VOICE_STORAGE_KEY = 'zotero-reader-tts-voice';
 	var MIN_SPEED = 0.25;
 	var MAX_SPEED = 4;
 
@@ -169,6 +170,48 @@
 		catch (e) { /* not worth breaking playback over */ }
 	}
 
+	/** The configured voice is the default; a per-browser choice overrides it. */
+	function loadVoice() {
+		try {
+			return localStorage.getItem(VOICE_STORAGE_KEY) || VOICE;
+		}
+		catch (e) {
+			return VOICE;
+		}
+	}
+
+	function saveVoice(v) {
+		try {
+			localStorage.setItem(VOICE_STORAGE_KEY, v);
+		}
+		catch (e) { /* not worth breaking playback over */ }
+	}
+
+	/**
+	 * Human label for a Kokoro voice id.
+	 *
+	 * Ids are `<lang><gender>_<name>`: `af_heart` is American English, female,
+	 * "heart". Grouping by that prefix turns a flat list of ~68 into something
+	 * scannable; anything with an unrecognised prefix still shows, under Other,
+	 * rather than being hidden.
+	 */
+	var VOICE_LANGS = {
+		a: 'American English', b: 'British English', e: 'Spanish', f: 'French',
+		h: 'Hindi', i: 'Italian', j: 'Japanese', p: 'Portuguese', z: 'Chinese'
+	};
+
+	function voiceGroup(id) {
+		var m = /^([a-z])([fm])_/.exec(id);
+		if (!m || !VOICE_LANGS[m[1]]) return 'Other';
+		return VOICE_LANGS[m[1]] + ' · ' + (m[2] === 'f' ? 'Female' : 'Male');
+	}
+
+	function voiceLabel(id) {
+		var m = /^[a-z][fm]_(.+)$/.exec(id);
+		var name = m ? m[1] : id;
+		return name.charAt(0).toUpperCase() + name.slice(1);
+	}
+
 	function el(tag, className, attrs) {
 		var node = document.createElement(tag);
 		if (className) node.className = className;
@@ -193,7 +236,7 @@
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({
 				model: 'kokoro',
-				voice: VOICE,
+				voice: voice,
 				input: text,
 				response_format: FORMAT,
 				speed: 1
@@ -236,6 +279,7 @@
 	var run = null;
 	var audio = null;
 	var speed = loadSpeed();
+	var voice = loadVoice();
 
 	function ensureAudio() {
 		if (audio) return audio;
@@ -545,6 +589,36 @@
 		playPart(run.index + 1, !(audio && audio.paused));
 	}
 
+	/**
+	 * Switch voice, re-synthesizing from where we are.
+	 *
+	 * Unlike speed -- which is `playbackRate` on the buffer already loaded, so
+	 * it applies instantly -- a voice change means every clip is wrong. Both
+	 * the parts already fetched AND any fetch still in flight would resolve in
+	 * the previous voice, so the run's parts are reset and its AbortController
+	 * replaced. Playback resumes at the same offset in the same part, so
+	 * switching voice does not lose the reader's place.
+	 */
+	function applyVoice(next) {
+		if (!next || next === voice) return;
+		voice = next;
+		saveVoice(voice);
+		if (ui.voice) ui.voice.value = voice;
+		if (!run) return;
+		var at = audio && isFinite(audio.currentTime) ? audio.currentTime : 0;
+		var wasPlaying = !!(audio && !audio.paused);
+		var index = run.index;
+		run.controller.abort();
+		run.controller = new AbortController();
+		run.parts.forEach(releasePart);
+		run.parts = run.parts.map(function (part) {
+			return { text: part.text, url: null, pending: null };
+		});
+		run.failed = null;
+		run.pendingSeek = { fromEnd: false, seconds: at };
+		playPart(index, wasPlaying);
+	}
+
 	function applySpeed(next) {
 		speed = clampSpeed(next);
 		applyRate(audio);
@@ -638,6 +712,24 @@
 		ui.part = el('span', 'ztts-part');
 		group.appendChild(ui.part);
 
+		ui.voice = el('select', 'ztts-voice', { 'aria-label': 'Voice' });
+		// Start with the current voice alone so the control is usable before
+		// (or without) the voice list arriving.
+		ui.voice.appendChild(
+			(function () {
+				var o = el('option');
+				o.value = voice;
+				o.textContent = voiceLabel(voice);
+				return o;
+			})()
+		);
+		ui.voice.value = voice;
+		ui.voice.addEventListener('change', function () {
+			applyVoice(ui.voice.value);
+		});
+		group.appendChild(ui.voice);
+		populateVoices();
+
 		ui.speed = el('select', 'ztts-speed', { 'aria-label': 'Reading speed' });
 		SPEEDS.forEach(function (s) {
 			var opt = el('option');
@@ -668,6 +760,71 @@
 		bar.appendChild(ui.error);
 
 		return bar;
+	}
+
+	/**
+	 * Fill the voice control from Kokoro's own list, so it stays right when the
+	 * server's voices change. Fetched once per page; on failure the control
+	 * keeps the single configured voice and read-aloud still works.
+	 */
+	var voicesLoaded = false;
+	function populateVoices() {
+		if (voicesLoaded) return;
+		voicesLoaded = true;
+		// Wrapped: this runs while the bar is being built, and a fetch that
+		// throws synchronously (an unusual polyfill, a blocked scheme) would
+		// otherwise propagate out of buildBar and leave the reader with no
+		// transport at all. A missing voice list must never cost more than the
+		// voice list.
+		try {
+		fetch(ENDPOINT + '/v1/audio/voices', { credentials: 'same-origin' })
+			.then(function (response) {
+				if (!response.ok) throw new Error('HTTP ' + response.status);
+				return response.json();
+			})
+			.then(function (body) {
+				var raw = (body && (body.voices || body.data)) || [];
+				var ids = raw.map(function (v) {
+					return typeof v === 'string' ? v : (v && (v.id || v.name));
+				}).filter(Boolean);
+				if (!ids.length || !ui.voice) return;
+				// Keep the active voice selectable even if the server stopped
+				// offering it, so a stored choice cannot silently change.
+				if (ids.indexOf(voice) === -1) ids.unshift(voice);
+
+				var groups = {};
+				var order = [];
+				ids.forEach(function (id) {
+					var g = voiceGroup(id);
+					if (!groups[g]) { groups[g] = []; order.push(g); }
+					groups[g].push(id);
+				});
+				order.sort(function (a, b) {
+					// "Other" last; everything else alphabetical.
+					if (a === 'Other') return 1;
+					if (b === 'Other') return -1;
+					return a.localeCompare(b);
+				});
+
+				ui.voice.innerHTML = '';
+				order.forEach(function (g) {
+					var grp = el('optgroup');
+					grp.label = g;
+					groups[g].sort().forEach(function (id) {
+						var o = el('option');
+						o.value = id;
+						o.textContent = voiceLabel(id);
+						grp.appendChild(o);
+					});
+					ui.voice.appendChild(grp);
+				});
+				ui.voice.value = voice;
+			})
+			.catch(function () {
+				// Leave the single configured voice in place.
+			});
+		}
+		catch (e) { /* same: the transport matters more than the list */ }
 	}
 
 	function setPhase(phase) {
