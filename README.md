@@ -480,6 +480,23 @@ Playback speed is applied as the audio element's `playbackRate`, so
 changing it is instant and never re-synthesizes; the choice is remembered
 per browser in `localStorage`.
 
+#### Where per-deployment config is applied
+
+`webLibraryPkg` (the npm build) is a **fixed-output derivation** — its build
+needs network access, so it is content-addressed by the declared
+`webLibraryHash`. Nix therefore reuses that store path however its inputs
+change. Anything injected inside it is frozen at whatever value was current
+when the hash was pinned.
+
+So `apiKey`, `userId` and `userSlug` are injected **after** it, in the
+ordinary `zotero-web-library-configured` derivation, along with the
+read-aloud assets when `readerTts.enable` is set. That layer is what nginx
+serves, and it rebuilds whenever those options change.
+
+If you inject anything of your own, do it there for the same reason —
+putting it in `webLibraryPkg` means editing it has no effect until
+`webLibraryHash` is re-pinned, which fails silently rather than loudly.
+
 #### Referencing the built SPA from host config (`builtRoot`)
 
 A host that customizes the vhost — overriding `locations."/"`, or pointing

@@ -486,19 +486,34 @@ let
     open(path, 'w').write(src)
   '';
 
-  # The SPA plus the read-aloud overlay.
+  # The SPA as actually served: the upstream build, with this deployment's
+  # config re-applied on top and the read-aloud overlay added when enabled.
   #
-  # Deliberately a SEPARATE derivation layered on top of webLibraryPkg rather
-  # than extra steps inside it: webLibraryPkg is fixed-output (it needs network
-  # access for npm, fonts and CSL styles), so anything added to it changes
-  # webLibraryHash. Editing reader-tts.js would then mean re-pinning that hash
-  # on every change. As an overlay the SPA build is untouched and its hash
-  # stays put.
-  webLibraryWithTts = pkgs.runCommand "zotero-web-library-tts" {
+  # This layer is NOT an optimisation, it is what makes per-deployment config
+  # settable at all. webLibraryPkg is fixed-output, because its build needs
+  # network access for npm, fonts and CSL styles. A fixed-output derivation is
+  # content-addressed by its DECLARED outputHash, so Nix reuses the existing
+  # store path however its inputs change: an apiKey / userId / userSlug edit
+  # inside webLibraryPkg produces no rebuild and no new path, and the old value
+  # keeps being served. Rotating a leaked apiKey silently did nothing.
+  #
+  # So the config injection runs HERE, in an ordinary derivation, over whatever
+  # webLibraryPkg baked in. The patcher rewrites the config block by id, so
+  # re-running it over an already-injected file is idempotent. The same
+  # reasoning keeps reader-tts.js out of the fixed-output build: editing it
+  # would otherwise mean re-pinning webLibraryHash every time.
+  webLibraryConfigured = pkgs.runCommand "zotero-web-library-configured" {
     nativeBuildInputs = [ pkgs.python3 ];
-  } ''
+  } (''
     cp -r ${webLibraryPkg} $out
     chmod -R u+w $out
+
+    # Re-apply this deployment's user config over the baked-in copy.
+    python3 ${webLibraryHtmlPatcher} $out/index.html
+
+    grep -q '"apiKey": "${cfg.webLibrary.apiKey}"' $out/index.html \
+      || { echo "ERROR: apiKey was not injected into index.html"; exit 1; }
+  '' + lib.optionalString cfg.webLibrary.readerTts.enable ''
 
     cp ${../assets/reader-tts/reader-tts.js} $out/static/web-library/reader-tts.js
     cp ${../assets/reader-tts/reader-tts.css} $out/static/web-library/reader-tts.css
@@ -511,11 +526,11 @@ let
     # reader and wonders where the button went.
     grep -q 'reader-tts.js' $out/index.html \
       || { echo "ERROR: read-aloud script tag was not injected into index.html"; exit 1; }
-  '';
+  '');
 
-  # What nginx serves at the SPA root.
-  webLibraryRoot =
-    if cfg.webLibrary.readerTts.enable then webLibraryWithTts else webLibraryPkg;
+  # What nginx serves at the SPA root. Always the configured layer, so config
+  # changes take effect whether or not read-aloud is enabled.
+  webLibraryRoot = webLibraryConfigured;
 
   # nginx location that fronts Kokoro for the read-aloud overlay.
   #
