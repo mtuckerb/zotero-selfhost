@@ -1,0 +1,181 @@
+/*
+ * Styling for the Kokoro read-aloud overlay (reader-tts.js).
+ *
+ * The controls are positioned OVER the reader rather than inserted into its
+ * layout: the reader iframe fills .reader-wrapper and web-library's own rules
+ * size it, so adding a flex child would fight that stylesheet on every
+ * upstream bump. An overlay is layout-neutral and only visible while reading.
+ *
+ * Colours come from the web-library CSS custom properties where they exist and
+ * fall back to literals otherwise, so the bar tracks the light/dark theme the
+ * user picked without this file needing to know which one is active.
+ */
+
+/* --- Read-aloud bar ------------------------------------------------------- */
+
+/* An ordinary flex child of .reader-wrapper, which upstream already lays out
+   as `display: flex; flex-direction: column` with `> iframe { flex: 1 1 100% }`.
+   Sitting in the flow rather than over it means the bar shortens the reader
+   instead of covering its last inch, and -- crucially -- .reader-wrapper needs
+   no `position`, so upstream's `.portal { position: absolute; inset: 0 }` (the
+   tag picker) keeps the containing block it has always had. */
+.ztts-bar {
+	flex: 0 0 auto;
+	display: flex;
+	align-items: center;
+	gap: 8px;
+	flex-wrap: wrap;
+	padding: 8px 12px;
+	box-sizing: border-box;
+	background: var(--material-toolbar, var(--material-background, #f2f2f2));
+	color: var(--fill-primary, #16181c);
+	border-top: 1px solid var(--fill-quinary, rgba(0, 0, 0, 0.12));
+	font: 13px/1.2 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+
+/* The transport only exists while something is being read; idle, the bar is
+   just the entry button. */
+.ztts-transport {
+	display: none;
+	flex: 1 1 auto;
+	align-items: center;
+	gap: 8px;
+	flex-wrap: wrap;
+}
+
+.ztts-bar.ztts-playing .ztts-transport {
+	display: flex;
+}
+
+.ztts-btn {
+	display: inline-flex;
+	align-items: center;
+	justify-content: center;
+	min-width: 30px;
+	height: 26px;
+	padding: 0 8px;
+	border: 1px solid var(--fill-quinary, rgba(0, 0, 0, 0.18));
+	border-radius: 4px;
+	background: transparent;
+	color: inherit;
+	cursor: pointer;
+	line-height: 1;
+}
+
+.ztts-btn:hover:not(:disabled) {
+	border-color: var(--accent-blue, #2e7fe4);
+}
+
+.ztts-btn:disabled {
+	opacity: 0.5;
+	cursor: default;
+}
+
+.ztts-btn.ztts-primary {
+	background: var(--accent-blue, #2e7fe4);
+	border-color: var(--accent-blue, #2e7fe4);
+	color: #fff;
+}
+
+.ztts-scrub {
+	flex: 1 1 140px;
+	min-width: 100px;
+	accent-color: var(--accent-blue, #2e7fe4);
+}
+
+.ztts-clock,
+.ztts-part {
+	font-size: 11px;
+	color: var(--fill-secondary, #6b7280);
+	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
+}
+
+.ztts-speed {
+	height: 26px;
+	padding: 0 4px;
+	border: 1px solid var(--fill-quinary, rgba(0, 0, 0, 0.18));
+	border-radius: 4px;
+	background: var(--material-background, #fff);
+	color: inherit;
+	font-size: 11px;
+}
+
+.ztts-error {
+	font-size: 11px;
+	color: var(--accent-red, #c8102e);
+	/* Wrap onto its own row rather than squeezing the controls. */
+	flex: 1 0 100%;
+}
+
+.ztts-error:empty {
+	display: none;
+}
+
+/* --- Entry points --------------------------------------------------------- */
+
+.ztts-doc-btn {
+	flex: 0 0 auto;
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	height: 26px;
+	padding: 0 12px;
+	border: 1px solid var(--fill-quinary, rgba(0, 0, 0, 0.18));
+	border-radius: 13px;
+	background: var(--material-background, #fff);
+	color: var(--fill-primary, #16181c);
+	cursor: pointer;
+	white-space: nowrap;
+	font: 12px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+
+.ztts-doc-btn:hover {
+	border-color: var(--accent-blue, #2e7fe4);
+}
+
+/* While reading, the transport carries stop/pause and the entry button would
+   only be a second way to do the same thing. */
+.ztts-bar.ztts-playing .ztts-doc-btn {
+	display: none;
+}
+
+.ztts-selection {
+	/* fixed, not absolute: the offsets handed to it are client rects, which
+	   are viewport-relative. */
+	position: fixed;
+	z-index: 20;
+	display: inline-flex;
+	align-items: center;
+	gap: 6px;
+	height: 30px;
+	padding: 0 12px;
+	border: none;
+	border-radius: 15px;
+	background: var(--accent-blue, #2e7fe4);
+	color: #fff;
+	box-shadow: 0 2px 10px rgba(0, 0, 0, 0.28);
+	cursor: pointer;
+	white-space: nowrap;
+	font: 12px/1 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+}
+
+@media (prefers-color-scheme: dark) {
+	.ztts-bar {
+		background: var(--material-toolbar, #33373d);
+		color: var(--fill-primary, #f2f2f2);
+		border-top-color: var(--fill-quinary, rgba(255, 255, 255, 0.16));
+	}
+
+	.ztts-btn,
+	.ztts-speed,
+	.ztts-doc-btn {
+		border-color: var(--fill-quinary, rgba(255, 255, 255, 0.22));
+	}
+
+	.ztts-speed,
+	.ztts-doc-btn {
+		background: var(--material-background, #33373d);
+		color: var(--fill-primary, #f2f2f2);
+	}
+}
