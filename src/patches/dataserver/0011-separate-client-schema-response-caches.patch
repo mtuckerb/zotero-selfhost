@@ -1,0 +1,60 @@
+Subject: [PATCH] Separate raw client schema response caches and fix tag diagnostics
+
+Schema versions 41 and 42 can resolve to the same effective schema while
+toJSON() includes lastRead only for 42+. Sharing their response cache entries
+causes mismatches (or incompatible cached responses). Include the requested
+schema in the cache key, preserving the serializer's existing behavior.
+
+Cache mismatch diagnostics must select type from tags, not itemTags. The
+incorrect alias turns otherwise recoverable cache differences into HTTP 500s.
+
+--- a/model/Item.inc.php
++++ b/model/Item.inc.php
+@@ -4187,6 +4187,9 @@
+ 			'locale',
+ 			'linkwrap',
+ 			'publications',
++			// lastRead visibility depends on the raw client version, which can
++			// differ even when getEffectiveVersion() returns the same version.
++			'schemaVersion',
+ 		];
+ 		$cachedParams = Z_Array::filterKeys($requestParams, $allowedParams);
+ 		$effectiveSchemaVersion = \Zotero\Schema::getEffectiveVersion(
+@@ -4193,7 +4196,7 @@
+ 			$requestParams['schemaVersion'] ?? null
+ 		);
+ 
+-		$cacheVersion = 7;
++		$cacheVersion = 8;
+ 		$cacheKey = "jsonEntry_" . $this->libraryID . "/" . $this->id . "_"
+ 			. md5(
+ 				$version
+@@ -4240,8 +4243,7 @@
+ 				$cached['data']['relations'] = $this->getRelations();
+ 			}
+ 
+-			// invalidProp is excluded from the cache since it depends on the raw
+-			// schemaVersion, not effectiveSchemaVersion
++			// invalidProp is excluded from the cache and re-added per request.
+ 			if ($this->needsInvalidProp($requestParams['schemaVersion'])) {
+ 				$cached['data']['invalidProp'] = 1;
+ 			}
+@@ -4576,7 +4579,7 @@
+ 				error_log("  db_itemData: " . json_encode($dbFields));
+ 
+ 				// Tags from current connection
+-				$sql = "SELECT T.name, IT.type FROM itemTags IT "
++				$sql = "SELECT T.name, T.type FROM itemTags IT "
+ 					. "JOIN tags T USING (tagID) WHERE IT.itemID=? ORDER BY T.name";
+ 				$dbTags = Zotero_DB::query($sql, $this->id, $shardID);
+ 				error_log("  db_tags: " . json_encode($dbTags ?: []));
+@@ -4583,8 +4585,7 @@
+ 			}
+ 		}
+ 
+-		// Strip invalidProp before caching -- it depends on the raw schemaVersion,
+-		// which isn't part of the cache key
++		// Strip invalidProp before caching and re-add it per request, as on cache hits.
+ 		$hadInvalidProp = isset($json['data']['invalidProp']);
+ 		unset($json['data']['invalidProp']);
+ 

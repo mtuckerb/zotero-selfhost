@@ -10,6 +10,9 @@
   };
 
   outputs = { self, nixpkgs, sops-nix, ... }: {
+    checks = nixpkgs.lib.genAttrs [ "x86_64-linux" "aarch64-linux" ] (system: {
+      reader-tts = nixpkgs.legacyPackages.${system}.callPackage ./nix/reader-tts-tests.nix { };
+    });
     nixosModules.default = {
       imports = [
         sops-nix.nixosModules.sops

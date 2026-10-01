@@ -153,6 +153,7 @@ let
     ../src/patches/dataserver/0008-drop-storage-class-standard-ia.patch
     ../src/patches/dataserver/0009-typeless-search-for-opensearch.patch
     ../src/patches/dataserver/0010-typeless-index-init-for-opensearch.patch
+    ../src/patches/dataserver/0011-separate-client-schema-response-caches.patch
   ];
 
   composerVendor = pkgs.stdenvNoCC.mkDerivation {
@@ -339,6 +340,9 @@ let
     pname = "zotero-web-library";
     version = "git";
     src = cfg.webLibrarySrc;
+    patches = [
+      ../src/patches/web-library/0001-all-attachment-metadata-and-automatic-parent.patch
+    ];
     # curl + unzip are needed by scripts/fetch-or-build-modules.mjs which
     # downloads pre-built reader/pdf-worker/note-editor zips from
     # zotero-download.s3.amazonaws.com. python3 is needed for the
@@ -446,6 +450,17 @@ let
       node scripts/check-icons.mjs
       node scripts/prepare-citeproc-js.mjs
 
+      # Keep attachment discovery and refresh confirmation behavior tied to
+      # the pinned production bundle, including stale-preview safeguards.
+      # collect-locale and build-styles-json above generate data imported by
+      # the store-backed workflow tests, so this must run after preparation.
+      npx jest \
+        test/attachment-metadata.test.js \
+        test/metadata-workflows.test.jsx \
+        test/recognize.test.jsx \
+        test/parent.test.jsx \
+        --runInBand
+
       # Build steps
       NODE_ENV=production npx rollup -c
       for f in src/scss/*.scss; do
@@ -474,11 +489,21 @@ let
     enabled = true;
     endpoint = "/reader-tts";
     voice = cfg.webLibrary.readerTts.voice;
+    pronunciations = cfg.webLibrary.readerTts.pronunciations;
     format = cfg.webLibrary.readerTts.format;
     seekStepSec = cfg.webLibrary.readerTts.seekStepSec;
     chunkMaxChars = cfg.webLibrary.readerTts.chunkMaxChars;
     speeds = map (s: builtins.fromJSON s) cfg.webLibrary.readerTts.speeds;
+    highlightStyle = cfg.webLibrary.readerTts.highlightStyle;
+    alignmentEndpoint =
+      if cfg.webLibrary.readerTts.alignment.enable
+      then "/reader-tts-align"
+      else null;
   };
+  readerTtsAssetVersion = builtins.substring 0 12 (builtins.hashString "sha256" (
+    (builtins.hashFile "sha256" ../assets/reader-tts/reader-tts.js)
+    + (builtins.hashFile "sha256" ../assets/reader-tts/reader-tts.css)
+  ));
 
   # Python helper that injects the read-aloud stylesheet, config block and
   # script into the built index.html, immediately before </head>.
@@ -491,11 +516,11 @@ let
         sys.exit(0)
     block = (
         '\t' + marker + '\n'
-        '\t<link rel="stylesheet" href="/static/web-library/reader-tts.css">\n'
+        '\t<link rel="stylesheet" href="/static/web-library/reader-tts.css?v=${readerTtsAssetVersion}">\n'
         '\t<script type="application/json" id="zotero-reader-tts-config">\n'
         '\t\t' + open(sys.argv[2]).read().strip() + '\n'
         '\t</script>\n'
-        '\t<script src="/static/web-library/reader-tts.js" defer></script>\n'
+        '\t<script src="/static/web-library/reader-tts.js?v=${readerTtsAssetVersion}" defer></script>\n'
     )
     if '</head>' not in src:
         sys.stderr.write('ERROR: no </head> in index.html; cannot inject read-aloud\n')
@@ -520,6 +545,11 @@ let
   # re-running it over an already-injected file is idempotent. The same
   # reasoning keeps reader-tts.js out of the fixed-output build: editing it
   # would otherwise mean re-pinning webLibraryHash every time.
+  # Continuous EPUB defaults and smooth PDF page navigation. Keep these
+  # patches outside the fixed-output build, and fail on upstream changes.
+  readerScrollingPatcher = ../assets/reader-scrolling/patch-reader-scrolling.py;
+  readerTtsTests = pkgs.callPackage ./reader-tts-tests.nix { };
+
   webLibraryConfigured = pkgs.runCommand "zotero-web-library-configured" {
     nativeBuildInputs = [ pkgs.python3 ];
   } (''
@@ -528,10 +558,16 @@ let
 
     # Re-apply this deployment's user config over the baked-in copy.
     python3 ${webLibraryHtmlPatcher} $out/index.html
+    python3 ${readerScrollingPatcher} $out/static/web-library/reader \
+      ${../assets/reader-scrolling/pdf-navigation.mjs} \
+      ${../assets/reader-scrolling/document-gestures.css}
 
     grep -q '"apiKey": "${effectiveApiKey}"' $out/index.html \
       || { echo "ERROR: apiKey was not injected into index.html"; exit 1; }
   '' + lib.optionalString cfg.webLibrary.readerTts.enable ''
+
+    # Every read-aloud deployment must pass extraction and playback tests.
+    test -f ${readerTtsTests}
 
     cp ${../assets/reader-tts/reader-tts.js} $out/static/web-library/reader-tts.js
     cp ${../assets/reader-tts/reader-tts.css} $out/static/web-library/reader-tts.css
@@ -568,7 +604,7 @@ let
   # (inherited from the SPA) and `authRequest` (an existing nginx auth_request
   # location, for a deployment that gates on a session cookie or SSO instead
   # of a second password).
-  readerTtsLocations = lib.optionalAttrs cfg.webLibrary.readerTts.enable {
+  readerTtsLocations = lib.optionalAttrs cfg.webLibrary.readerTts.enable ({
     "/reader-tts/" = {
       proxyPass = "${cfg.webLibrary.readerTts.kokoroUrl}/";
       # Deliberately NO proxy_set_header for Host / X-Real-IP / X-Forwarded-*.
@@ -594,13 +630,27 @@ let
     } // (lib.optionalAttrs (cfg.webLibrary.basicAuthFile != null) {
       basicAuthFile = cfg.webLibrary.basicAuthFile;
     });
-  };
+  } // lib.optionalAttrs cfg.webLibrary.readerTts.alignment.enable {
+    "/reader-tts-align/" = {
+      proxyPass = "http://${cfg.webLibrary.readerTts.alignment.listenAddress}:${toString cfg.webLibrary.readerTts.alignment.port}/";
+      extraConfig = ''
+        client_max_body_size ${cfg.webLibrary.readerTts.alignment.maxBodySize};
+        proxy_read_timeout ${toString (cfg.webLibrary.readerTts.alignment.timeoutSec + 30)}s;
+        proxy_send_timeout 300s;
+      '' + lib.optionalString (cfg.webLibrary.readerTts.authRequest != null) ''
+        auth_request ${cfg.webLibrary.readerTts.authRequest};
+      '';
+    } // (lib.optionalAttrs (cfg.webLibrary.basicAuthFile != null) {
+      basicAuthFile = cfg.webLibrary.basicAuthFile;
+    });
+  });
 
   dataDir = cfg.stateDir;
   runtimeDir = "${cfg.stateDir}/runtime";
   dataserverRuntime = "${runtimeDir}/dataserver";
   streamRuntime = "${runtimeDir}/stream-server";
   tinymceRuntime = "${runtimeDir}/tinymce-clean-server";
+  readerTtsAlignRuntime = "${runtimeDir}/reader-tts-align";
   secretName = suffix: "${cfg.secretPrefix}/${suffix}";
   secretKeys = {
     authSalt = secretName "auth-salt";
@@ -1081,7 +1131,7 @@ in {
 
     webLibraryHash = mkOption {
       type = types.str;
-      default = "sha256-Xhr57zOek+8ATf9k7X0Xh0eKICvsd4Xqg7+C2bvJYBU=";
+      default = "sha256-3xydMxs7d+lVX6cAdRlgh70uJkquKvOuYEKtmXoPbH8=";
       description = ''
         SRI hash of the built web-library bundle (the result of
         `npm install && npm run build`). The build is wrapped as a
@@ -1571,6 +1621,20 @@ in {
           description = "Kokoro voice id used for reader playback.";
         };
 
+        pronunciations = mkOption {
+          type = types.attrsOf types.str;
+          default = { meso = "mˈɛzO"; };
+          example = { meso = "mˈɛzO"; worcester = "wˈʊstər"; };
+          description = ''
+            Whole words mapped to Kokoro phonemes for English voices.
+            Matching is case-insensitive and includes hyphenated words
+            such as meso-level. Only the synthesis request is changed;
+            displayed text, seeking, and alignment keep the source words.
+            The default reads meso as MEH-zoh. Set to {} to disable.
+            Use Kokoro's /dev/phonemize endpoint to check phoneme strings.
+          '';
+        };
+
         format = mkOption {
           type = types.enum [ "mp3" "wav" "opus" "flac" ];
           default = "mp3";
@@ -1586,7 +1650,8 @@ in {
           default = null;
           example = "/_auth_validate";
           description = ''
-            Optional nginx `auth_request` target guarding `/reader-tts/`.
+            Optional nginx `auth_request` target guarding `/reader-tts/`
+            and, when forced alignment is enabled, `/reader-tts-align/`.
 
             Synthesis is expensive, so on any deployment reachable from the
             internet the endpoint needs a gate or it is free GPU for whoever
@@ -1597,9 +1662,10 @@ in {
 
             Set this to an internal location that returns 2xx for an
             authenticated request and 401/403 otherwise, and `/reader-tts/`
-            will accept exactly the users that location accepts. The location
-            itself is NOT defined here -- it belongs to whatever provides the
-            session -- so point this at one that already exists on the vhost.
+            plus `/reader-tts-align/` will accept exactly the users that
+            location accepts. The location itself is NOT defined here -- it
+            belongs to whatever provides the session -- so point this at one
+            that already exists on the vhost.
 
             Combines with `basicAuthFile`: set both and a request must satisfy
             both. Leave null on a deployment where the whole vhost is already
@@ -1625,6 +1691,16 @@ in {
           '';
         };
 
+        highlightStyle = mkOption {
+          type = types.enum [ "sentence" "word" "ball" ];
+          default = "ball";
+          description = ''
+            Default read-along highlight style when forced alignment is
+            enabled. The browser remembers the user's last choice in
+            localStorage, so this only controls first use.
+          '';
+        };
+
         speeds = mkOption {
           type = types.listOf types.str;
           default = [ "0.75" "1" "1.25" "1.5" "1.75" "2" ];
@@ -1634,6 +1710,76 @@ in {
             Applied as the audio element's playbackRate, so changing
             speed is instant and never re-synthesizes.
           '';
+        };
+
+        alignment = {
+          enable = mkOption {
+            type = types.bool;
+            default = false;
+            description = ''
+              Enable Parlyx-backed forced alignment for read-aloud parts.
+              When enabled, the overlay uploads each synthesized part to a
+              local sidecar service, which submits it to Parlyx and returns
+              word timings for sentence, word, and bouncing-ball highlighting.
+            '';
+          };
+
+          parlyxUrl = mkOption {
+            type = types.str;
+            default = "http://127.0.0.1:3000";
+            example = "http://federalnix.lan:3000";
+            description = ''
+              Base URL of the Parlyx server used by the alignment sidecar.
+              This must be reachable from the nginx host, not from the browser.
+            '';
+          };
+
+          parlyxApiKeyFile = mkOption {
+            type = types.nullOr types.path;
+            default = null;
+            example = "/run/secrets/parlyx/zotero-reader-api-key";
+            description = ''
+              Path to a file containing a Parlyx bearer token. Required when
+              forced alignment is enabled. The key is read by the sidecar at
+              request time and is never injected into the browser.
+            '';
+          };
+
+          listenAddress = mkOption {
+            type = types.str;
+            default = "127.0.0.1";
+            description = "Address for the local alignment sidecar to bind.";
+          };
+
+          port = mkOption {
+            type = types.port;
+            default = 8891;
+            description = "Port for the local alignment sidecar.";
+          };
+
+          timeoutSec = mkOption {
+            type = types.ints.positive;
+            default = 180;
+            description = "Maximum seconds to wait for Parlyx to align one read-aloud part.";
+          };
+
+          pollMs = mkOption {
+            type = types.ints.positive;
+            default = 1000;
+            description = "Milliseconds between Parlyx task status polls.";
+          };
+
+          maxAudioBytes = mkOption {
+            type = types.ints.positive;
+            default = 25 * 1024 * 1024;
+            description = "Largest synthesized part the alignment sidecar will accept.";
+          };
+
+          maxBodySize = mkOption {
+            type = types.str;
+            default = "40m";
+            description = "nginx client_max_body_size for alignment requests.";
+          };
         };
       };
     };
@@ -1653,6 +1799,15 @@ in {
           services.zotero-selfhost.webLibrary: set exactly one of `apiKey`
           (plain string, ends up in git and the nix store) or `apiKeyFile`
           (read at activation, kept out of both).
+        '';
+      }
+      {
+        assertion = !cfg.webLibrary.readerTts.enable
+          || !cfg.webLibrary.readerTts.alignment.enable
+          || cfg.webLibrary.readerTts.alignment.parlyxApiKeyFile != null;
+        message = ''
+          services.zotero-selfhost.webLibrary.readerTts.alignment:
+          set `parlyxApiKeyFile` when forced alignment is enabled.
         '';
       }
       {
@@ -1698,6 +1853,7 @@ in {
       "d ${dataserverRuntime}/htdocs 0755 ${cfg.user} ${cfg.group} - -"
       "d ${streamRuntime} 0755 ${cfg.user} ${cfg.group} - -"
       "d ${tinymceRuntime} 0755 ${cfg.user} ${cfg.group} - -"
+      "d ${readerTtsAlignRuntime} 0755 ${cfg.user} ${cfg.group} - -"
     ];
 
     environment.systemPackages = [ initScript createUserScript ];
@@ -1750,6 +1906,32 @@ in {
         RestartSec = 5;
       };
     };
+
+    systemd.services.zotero-selfhost-reader-tts-align =
+      lib.mkIf (cfg.webLibrary.enable && cfg.webLibrary.readerTts.enable && cfg.webLibrary.readerTts.alignment.enable) {
+        description = "Zotero reader TTS forced-alignment proxy";
+        wantedBy = [ "multi-user.target" ];
+        after = [ "network-online.target" "sops-install-secrets.service" ];
+        wants = [ "network-online.target" "sops-install-secrets.service" ];
+        serviceConfig = {
+          Type = "simple";
+          User = cfg.user;
+          Group = cfg.group;
+          WorkingDirectory = readerTtsAlignRuntime;
+          Environment = [
+            "PARLYX_BASE_URL=${cfg.webLibrary.readerTts.alignment.parlyxUrl}"
+            "PARLYX_API_KEY_FILE=${optionalString (cfg.webLibrary.readerTts.alignment.parlyxApiKeyFile != null) (toString cfg.webLibrary.readerTts.alignment.parlyxApiKeyFile)}"
+            "ZOTERO_READER_TTS_ALIGN_HOST=${cfg.webLibrary.readerTts.alignment.listenAddress}"
+            "ZOTERO_READER_TTS_ALIGN_PORT=${toString cfg.webLibrary.readerTts.alignment.port}"
+            "ZOTERO_READER_TTS_ALIGN_TIMEOUT_SEC=${toString cfg.webLibrary.readerTts.alignment.timeoutSec}"
+            "ZOTERO_READER_TTS_ALIGN_POLL_MS=${toString cfg.webLibrary.readerTts.alignment.pollMs}"
+            "ZOTERO_READER_TTS_ALIGN_MAX_AUDIO_BYTES=${toString cfg.webLibrary.readerTts.alignment.maxAudioBytes}"
+          ];
+          ExecStart = "${pkgs.python3}/bin/python3 ${../assets/reader-tts/reader-tts-align.py}";
+          Restart = "always";
+          RestartSec = 5;
+        };
+      };
 
     systemd.services.zotero-selfhost = {
       description = "Zotero Selfhost dataserver";
