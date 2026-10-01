@@ -304,6 +304,29 @@ work fine without it (clients fall back to polling).
 
 ### Adding the web library frontend
 
+The packaged reader defaults to continuous vertical scrolling for EPUBs, PDFs,
+and snapshots. EPUBs with an older saved page-by-page layout switch to continuous
+scrolling once, preserving the reading position and text size. The reader then
+remembers subsequent layout choices. **Appearance → Flow Mode → Scrolled** enables
+continuous scrolling; **Paginated** switches it back.
+
+Saved EPUB highlights and their click targets are recalculated when chapter
+sizes change after loading, including Firefox text reflow and delayed images
+or fonts. This also handles a chapter above the visible passage changing size;
+the saved text anchors and annotations remain unchanged.
+`tests/reader-epub-highlights.browser.cjs` checks these cases and switching
+between paginated and continuous layouts in the packaged reader. Use the
+`ZOTERO_TEST_READER_ROOT`, `PLAYWRIGHT_MODULE`, and `FIREFOX_BINARY` environment
+variables described for the other reader browser tests below.
+
+PDF mouse-wheel scrolling, previous/next page buttons, and page-navigation keys
+scroll smoothly between pages. Saved single-page PDF layouts reopen in continuous vertical mode, keeping
+the saved reading position and zoom. Reduced-motion preferences disable the
+animation. Wheel input accumulates during scrolling so repeated wheel steps flow
+across page boundaries. On touchscreens, pinching over a PDF changes the
+reader's PDF zoom instead of the browser viewport; one-finger panning,
+other touch gestures, and opening a saved position retain their native behavior.
+
 The upstream NixOS module deploys only the dataserver, stream-server,
 tinymce-clean-server, and minio. To get a browsable web UI for human
 users, build and deploy `zotero/web-library` separately.
@@ -411,13 +434,20 @@ SPA will require `admin` + the password you set.
 `webLibrary.readerTts` adds text-to-speech to the reader: select text and
 press **Read selection**, or press **Read aloud** to read the whole
 attachment. Playback gets a transport bar — previous/next part, rewind and
-fast-forward, play/pause, a scrub bar, and a speed selector.
+fast-forward, play/pause, a scrub bar, and a speed selector. With forced
+alignment enabled, the bar also shows SoundShelf-style read-along highlighting:
+sentence, word, or bouncing ball.
 
 ```nix
 services.zotero-selfhost.webLibrary.readerTts = {
   enable = true;
   kokoroUrl = "http://federalnix.lan:8890";  # reachable from the nginx host
   voice = "af_heart";
+  alignment = {
+    enable = true;
+    parlyxUrl = "http://federalnix.lan:3000";
+    parlyxApiKeyFile = "/run/secrets/parlyx/zotero-reader-api-key";
+  };
 };
 ```
 
@@ -433,10 +463,11 @@ hostname. Two gates are available and they compose:
 - `readerTts.authRequest` — an nginx `auth_request` target, for a
   deployment that already authenticates some other way and does not want
   a second password. Point it at an internal location returning 2xx when
-  authenticated and 401/403 otherwise; `/reader-tts/` then accepts
-  exactly the users that location accepts. The location is not defined
-  by this module — it belongs to whatever provides the session — so use
-  one that already exists on the vhost:
+  authenticated and 401/403 otherwise; `/reader-tts/`, and
+  `/reader-tts-align/` when forced alignment is enabled, then accept
+  exactly the users that location accepts. The location is not defined by
+  this module — it belongs to whatever provides the session — so use one
+  that already exists on the vhost:
 
   ```nix
   services.zotero-selfhost.webLibrary.readerTts.authRequest = "/_auth_validate";
@@ -457,30 +488,119 @@ dataserver.
 *How it is wired.* `zotero/reader` is downloaded as a prebuilt zip during
 the web-library build, so there is no reader source tree here to patch.
 Instead an overlay script and stylesheet from `assets/reader-tts/` are
-layered onto the built SPA by a second derivation (`webLibraryWithTts`)
-and injected into `index.html`. That derivation is deliberately separate
+layered onto the built SPA by the configured web-library derivation and
+injected into `index.html`. That derivation is deliberately separate
 from `webLibraryPkg`: `webLibraryPkg` is fixed-output, so folding the
 overlay into it would mean re-pinning `webLibraryHash` on every edit to
 the JavaScript. The overlay reaches the reader's selection because the
 reader runs in a same-origin iframe
 (`/static/web-library/reader/reader.html`).
 
-*Reading a whole attachment needs indexed full text.* The reader renders
-pages lazily, so there is no complete document in the DOM to read; the
-overlay fetches `GET /users/<id>/items/<key>/fulltext` instead. That is
-populated by the desktop client's full-text indexing and sync, so an
-attachment the desktop client has never indexed reports "No indexed full
-text for this attachment". Reading a **selection** has no such
-requirement and works on any open document.
+*PDF read-aloud uses the document's page layout.* The overlay extracts all
+pages through the reader's PDF.js document, including pages that have not
+been rendered. It assembles OCR fragments into lines and reads each column
+from top to bottom, with full-width titles and abstracts in their place.
+Before synthesis, it skips JSTOR metadata covers, tagged notes and artifacts,
+rotated margin notices, running page headers, page numbers, publisher print
+footers, and separate smaller footnote blocks. Small type alone does not
+make body text a footnote. Chapter and section headings remain. Untagged
+PDFs use layout heuristics, so unusual layouts can still need manual text
+selection. No desktop
+full-text index is required for PDFs; image-only PDFs need a text layer.
+
+EPUBs and snapshots still fetch `GET /users/<id>/items/<key>/fulltext`,
+populated by the desktop client's full-text indexing and sync. Their
+indexed text lacks the layout needed for reliable footnote filtering.
+Markdown ATX headings (`# Heading` through `###### Heading`) are read without
+the hash markers and receive a sentence-and-paragraph boundary so the voice
+pauses before continuing into the section body.
+
+**Read selection** skips semantic headers, footers, and notes, and applies
+the same column order and page-layout filter to visible PDF text. The PDF
+highlight follows that order as well. It does not require indexing.
+Hyphens at line breaks join word fragments before synthesis, including
+across column and page boundaries; ordinary within-line hyphens remain.
+This also handles PDF spacing around a line-ending hyphen, separate hyphen
+text fragments, Unicode line breaks, and words split over several lines.
+Discretionary soft hyphens are removed even inside a line. PDF highlighting
+follows all fragments of a joined word.
+This requires the hyphen to be present in the PDF's text layer: missing
+characters in a scan's OCR are not guessed.
+These filters affect the web reader's speech input; they do not change
+the original PDF's accessibility tags or an operating-system screen reader.
+
+While reading, **Command-click** (macOS) or **Ctrl-click** (Windows/Linux)
+any word in the document to jump there, including earlier or later audio
+parts. Playback keeps its playing or paused state. Cached word timings are
+used when available; otherwise, audio is generated starting at that word,
+so jumping also works without forced alignment. The reading position is
+remembered when the document is reopened. If playback began with **Read
+selection**, clicking outside that selection loads the full document and
+continues from the clicked word.
+
+With word alignment enabled, read-aloud advances the reader only when the
+spoken word reaches the edge of the visible area. Scrolling, swiping, or
+using page-navigation keys pauses automatic following while audio keeps
+playing. Click **Follow reading** to return to the spoken text and resume
+automatic page turns. **Following reading** can also be clicked to pause
+following before browsing elsewhere. Starting a new reading enables it again.
+
+Run the text-extraction and playback regression checks with
+`node --test tests/reader-tts-*.test.cjs`.
+The Nix web-library build requires these checks to pass whenever read-aloud
+is enabled; they also run through `nix flake check path:.`. Coverage includes
+every wrap position in sample words, PDF selections and highlights, column
+and page boundaries, and the text sent to synthesis and alignment. To test
+an already packaged or downloaded script, set `ZOTERO_TEST_TTS_SCRIPT` to
+its absolute path before running the Node command.
+
+`tests/reader-tts.browser.cjs` also checks extraction, selection, and highlight
+ranges in the packaged PDF.js reader using a synthetic two-page PDF. Run it
+with `node --test tests/reader-tts.browser.cjs`, setting
+`ZOTERO_TEST_READER_ROOT` to the built `static/web-library/reader` directory,
+`ZOTERO_TEST_TTS_SCRIPT` to the packaged overlay, and `PLAYWRIGHT_MODULE` /
+`FIREFOX_BINARY` to a compatible Playwright installation and Firefox binary.
+With the same environment, `tests/reader-tts-follow.browser.cjs` checks manual
+browsing, resuming follow, page turns, PDF pages that are not yet rendered,
+and continuous and paginated EPUBs, including chapter transitions.
 
 The voice control sits in the transport bar. Changing it re-synthesizes
 from the current position — unlike speed, which is `playbackRate` on audio
 already loaded and so applies instantly. The choice is remembered per
 browser in `localStorage`, the same as speed.
 
+*Pronunciation corrections.* English voices read **meso** as **MEH-zoh**,
+including **Meso-level**. `readerTts.pronunciations` maps whole words to
+Kokoro phonemes, matched without regard to capitalization. The reader adds
+Kokoro's `[word](/phonemes/)` notation only to the audio request, so the
+document, read-along text, seeking, and alignment keep the original words.
+Longer words such as **mesosystem** are not changed by a **meso** entry.
+For additional corrections, configure the dictionary explicitly:
+
+```nix
+services.zotero-selfhost.webLibrary.readerTts.pronunciations = {
+  meso = "mˈɛzO";  # MEH-zoh; Kokoro uses O for the English long-o sound
+  worcester = "wˈʊstər";
+};
+```
+
+Set `pronunciations = {};` to disable corrections. Non-English voices
+ignore this dictionary. Use the running Kokoro server's `/dev/phonemize`
+endpoint to check phonemes. Reload the reader and start playback again
+after changing the dictionary so it generates fresh audio.
+
+*Forced alignment.* `readerTts.alignment.enable` starts a local sidecar
+that receives each synthesized part from the browser, uploads it to
+Parlyx, waits for the timestamped transcript, aligns that transcript back
+to the exact source words, and returns a compact timeline. nginx exposes
+the sidecar at `/reader-tts-align/` on the SPA origin and applies the same
+`basicAuthFile` / `authRequest` gates as `/reader-tts/`, so the Parlyx
+bearer token stays server-side in `parlyxApiKeyFile`.
+
 Other options: `format` (default `mp3`), `seekStepSec` (default 15),
 `chunkMaxChars` (default 1500 — lower starts playing sooner and gives
-finer part granularity, higher means fewer seams), and `speeds`.
+finer part granularity, higher means fewer seams), `highlightStyle`
+(default `ball`), and `speeds`.
 Playback speed is applied as the audio element's `playbackRate`, so
 changing it is instant and never re-synthesizes; the choice is remembered
 per browser in `localStorage`.
@@ -623,15 +743,14 @@ The response should include `"success": { "0": "<8-char-key>" }`.
 - **Pre-existing failing services on the example host** (e.g.
   `cliproxyapi-dashboard`, `ollama-model-loader`) are unrelated to
   zotero — ignore when triaging.
-- **Read-aloud reads whole documents only from the full-text index.**
-  See `webLibrary.readerTts` above: an attachment the desktop client has
-  not indexed and synced can only be read by selecting text. There is no
-  client-side PDF text extraction fallback.
-- **Read-aloud does not highlight the words being spoken.** Kokoro
-  returns no word timings, and the reader's PDF text layer is virtualized
-  (nodes are recycled as pages scroll out), so a highlight anchored to
-  them would drift and detach. The transport bar reports position within
-  the current part instead.
+- **PDF read-aloud filters page extras using layout.** See
+  `webLibrary.readerTts` above. EPUB and snapshot whole-document reading
+  still requires the desktop client's synced full-text index.
+- **Read-aloud highlighting follows the read-along strip, not the PDF text
+  layer.** The reader's PDF text layer is virtualized (nodes are recycled
+  as pages scroll out), so DOM highlights anchored to PDF glyphs would
+  drift and detach. With `readerTts.alignment.enable`, Parlyx timings drive
+  a stable read-along strip in the transport bar instead.
 - **The read-aloud voice list comes from the running Kokoro server.** The
   transport bar fetches `/reader-tts/v1/audio/voices` and groups the
   result by the `<lang><gender>_` id prefix; `readerTts.voice` is only the

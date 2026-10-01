@@ -1,0 +1,1811 @@
+diff --git a/package-lock.json b/package-lock.json
+index a0ef07f7..dea4ce62 100644
+--- a/package-lock.json
++++ b/package-lock.json
+@@ -38,7 +38,8 @@
+         "redux-async-queue": "^1.0.0",
+         "redux-thunk": "^3.1.0",
+         "use-debounce": "^10.1.0",
+-        "zotero-api-client": "^0.48.0"
++        "zotero-api-client": "^0.48.0",
++        "fflate": "0.8.3"
+       },
+       "devDependencies": {
+         "@babel/core": "^7.29.0",
+@@ -15647,6 +15648,12 @@
+       "engines": {
+         "node": ">= 18.0.0"
+       }
++    },
++    "node_modules/fflate": {
++      "version": "0.8.3",
++      "resolved": "https://registry.npmjs.org/fflate/-/fflate-0.8.3.tgz",
++      "integrity": "sha512-tbZNuJrLwGUp3zshBtdy4W+ORxZuIh8a5ilyIEQDC5rY1f3U20JMry0Ll3WBzU58EZKsEuJFXhb5gwv8CsPvgA==",
++      "license": "MIT"
+     }
+   }
+ }
+diff --git a/package.json b/package.json
+index 813a07f7..e672d140 100644
+--- a/package.json
++++ b/package.json
+@@ -106,7 +106,8 @@
+     "redux-async-queue": "^1.0.0",
+     "redux-thunk": "^3.1.0",
+     "use-debounce": "^10.1.0",
+-    "zotero-api-client": "^0.48.0"
++    "zotero-api-client": "^0.48.0",
++    "fflate": "0.8.3"
+   },
+   "devDependencies": {
+     "@babel/core": "^7.29.0",
+diff --git a/src/js/actions/items-read.js b/src/js/actions/items-read.js
+index 17b8ebab..ef732b58 100644
+--- a/src/js/actions/items-read.js
++++ b/src/js/actions/items-read.js
+@@ -233,11 +233,11 @@ const sortItemsSecondary = (sortBy, sortDirection) => {
+ 	}
+ };
+ 
+-const getAttachmentUrl = (itemKey, forceFresh = false) => {
++const getAttachmentUrl = (itemKey, forceFresh = false, requestedLibraryKey = null) => {
+ 	return async (dispatch, getState) => {
+ 		const state = getState();
+-		const { libraryKey } = state.current;
+-		const attachmentURLdata = state.libraries[state.current.libraryKey]?.attachmentsUrl[itemKey];
++		const libraryKey = requestedLibraryKey ?? state.current.libraryKey;
++		const attachmentURLdata = state.libraries[libraryKey]?.attachmentsUrl[itemKey];
+ 
+ 		try {
+ 			const isURLFresh = !forceFresh && (attachmentURLdata && Date.now() - attachmentURLdata.timestamp < 60000);
+diff --git a/src/js/actions/recognize.js b/src/js/actions/recognize.js
+index a5f7cc19..3d32615c 100644
+--- a/src/js/actions/recognize.js
++++ b/src/js/actions/recognize.js
+@@ -1,97 +1,205 @@
+-import { createItem, deleteItem, getAttachmentUrl, updateItem, renameAttachment } from '.';
++import { createItem, deleteItem, fetchItemsByKeys, getAttachmentUrl, updateItem, renameAttachment } from '.';
+ import { BEGIN_RECOGNIZE_DOCUMENT, COMPLETE_RECOGNIZE_DOCUMENT, ERROR_RECOGNIZE_DOCUMENT,
+ 	UPDATE_RECOGNIZE_DOCUMENT, BEGIN_UNRECOGNIZE_DOCUMENT, COMPLETE_UNRECOGNIZE_DOCUMENT,
+ 	ERROR_UNRECOGNIZE_DOCUMENT, } from '../constants/actions';
+ import { PDFWorker } from '../common/pdf-worker.js';
+-import { pick } from 'web-common/utils';
++import { omit, pick } from 'web-common/utils';
+ import { getItemFromIdentifier } from '../common/identifiers';
+ import { getFileBaseNameFromItem, getValidFileName } from '../common/format';
++import {
++	attachmentFormat, basicAttachmentMetadata, buildMetadataRefreshChanges, buildMetadataRefreshPatch,
++	canRetrieveAttachmentMetadata, findMetadataAttachment, getMetadataAttachmentKey, retrieveNonPDFMetadata, supplementWeakPDFMetadata
++} from '../common/attachment-metadata';
+ 
++// Ignore duplicate clicks while a file is already being processed.
++const pendingRetrievals = new Set();
+ const retrieveMetadata = (itemKey, libraryKey, backgroundTaskId) => {
+ 	return async (dispatch, getState) => {
++		const pendingKey = `${libraryKey}-${itemKey}`;
++		if (pendingRetrievals.has(pendingKey)) return;
++		pendingRetrievals.add(pendingKey);
+ 		dispatch({ type: BEGIN_RECOGNIZE_DOCUMENT, itemKey, libraryKey, backgroundTaskId });
+-		const state = getState();
+-		const attachmentItem = state.libraries[state.current.libraryKey]?.items?.[itemKey];
+-		const originalFilename = attachmentItem.filename;
+-		const originalTitle = attachmentItem.title;
++		let createdParent;
+ 		try {
+-			const recognizerData = await dispatch(getRecognizerData(itemKey));
+-			dispatch({ type: UPDATE_RECOGNIZE_DOCUMENT, itemKey, libraryKey, stage: 1 });
+-			const recognizedItem = await dispatch(recognizePDF(recognizerData));
+-
++			const state = getState();
++			const attachmentItem = state.libraries[libraryKey]?.items?.[itemKey];
++			if (state.config.libraries.find(l => l.key === libraryKey)?.isReadOnly) {
++				throw new Error('This library is read-only.');
++			}
++			if (!canRetrieveAttachmentMetadata(attachmentItem)) {
++				throw new Error('Select an attachment without a parent item.');
++			}
++			const { filename: originalFilename, title: originalTitle } = attachmentItem;
++			const result = await dispatch(getAttachmentMetadata(itemKey, libraryKey, stage => {
++				dispatch({ type: UPDATE_RECOGNIZE_DOCUMENT, itemKey, libraryKey, stage });
++			}));
++			const { metadata: recognizedItem, format } = result;
++			let { warning } = result;
++			// Recheck after extraction/lookup in case another action attached the file.
++			if (!canRetrieveAttachmentMetadata(getState().libraries[libraryKey]?.items?.[itemKey])) {
++				throw new Error('This attachment already has a parent item.');
++			}
+ 			dispatch({ type: UPDATE_RECOGNIZE_DOCUMENT, itemKey, libraryKey, stage: 2 });
+-			delete recognizedItem.key;
+-			delete recognizedItem.version;
+-			recognizedItem.collections = [...attachmentItem.collections];
+-			const item = await dispatch(createItem(recognizedItem, libraryKey));
+-
++			const metadata = omit(recognizedItem, ['key', 'version', 'attachments', 'notes']);
++			metadata.collections = [...(attachmentItem.collections || [])];
++			createdParent = await dispatch(createItem(metadata, libraryKey));
+ 			dispatch({ type: UPDATE_RECOGNIZE_DOCUMENT, itemKey, libraryKey, stage: 3 });
+-			await dispatch(updateItem(itemKey, { parentItem: item.key, title: 'PDF', collections: [] }, libraryKey));
+-			const newFileName = getValidFileName(`${getFileBaseNameFromItem(item, state.meta.mappings)}.pdf`);
+-			await dispatch(renameAttachment(itemKey, newFileName, libraryKey));
+-			dispatch({ type: COMPLETE_RECOGNIZE_DOCUMENT, itemKey, libraryKey, parentItemKey: item.key, originalFilename, originalTitle });
++			const title = format === 'pdf' ? 'PDF' : format === 'epub' ? 'EPUB' : originalTitle;
++			await dispatch(updateItem(itemKey, { parentItem: createdParent.key, title, collections: [] }, libraryKey));
++			// Preserve the actual file format. Links and generic files keep their names.
++			if (['pdf', 'epub'].includes(format) && attachmentItem.linkMode === 'imported_file') {
++				const extension = originalFilename?.match(/\.[^.]+$/)?.[0] || `.${format}`;
++				const newFileName = getValidFileName(`${getFileBaseNameFromItem(createdParent, state.meta.mappings)}${extension}`);
++				try {
++					await dispatch(renameAttachment(itemKey, newFileName, libraryKey));
++				} catch {
++					warning = 'Parent created; the file could not be renamed';
++				}
++			}
++			dispatch({ type: COMPLETE_RECOGNIZE_DOCUMENT, itemKey, libraryKey, parentItemKey: createdParent.key, originalFilename, originalTitle, warning });
++			return createdParent;
+ 		} catch (error) {
+ 			dispatch({
+-				type: ERROR_RECOGNIZE_DOCUMENT,
+-				itemKey,
+-				libraryKey,
+-				silent: true, // do not display an error message, this error is only relevant in the recognizer UI
+-				error: error?.message ?? 'Failed to recognize document'
++				type: ERROR_RECOGNIZE_DOCUMENT, itemKey, libraryKey, silent: true,
++				error: createdParent
++					? `Parent "${createdParent.title}" was created, but the attachment could not be moved. Use Change Parent Item to attach it before retrying.`
++					: error?.message || 'Failed to recognize document'
+ 			});
++		} finally {
++			pendingRetrievals.delete(pendingKey);
+ 		}
++	};
++};
++
++const readAttachmentFile = (itemKey, libraryKey) => async dispatch => {
++	let url = await dispatch(getAttachmentUrl(itemKey, false, libraryKey));
++	let response = await fetch(url);
++	if (response.status === 410) {
++		url = await dispatch(getAttachmentUrl(itemKey, true, libraryKey));
++		response = await fetch(url);
+ 	}
+-}
++	if (!response.ok) throw new Error(`Could not download the attachment (${response.status}). Try again after syncing the file.`);
++	return response.arrayBuffer();
++};
+ 
++// PDFs retain the existing text-extraction and recognizer service workflow.
++const getRecognizerData = (itemKey, libraryKey) => async (dispatch, getState) => {
++	const state = getState();
++	const attachmentItem = state.libraries[libraryKey]?.items?.[itemKey];
++	const data = await dispatch(readAttachmentFile(itemKey, libraryKey));
++	const { pdfWorkerURL, pdfReaderCMapsURL, pdfReaderStandardFontsURL } = state.config;
++	const pdfWorker = new PDFWorker({ pdfWorkerURL, pdfReaderCMapsURL, pdfReaderStandardFontsURL });
++	const recognizerInputData = await pdfWorker.getRecognizerData(data);
++	recognizerInputData.fileName = attachmentItem.filename;
++	return recognizerInputData;
++};
+ 
+-// extract metadata from the PDF and send it to the recognizer server
+-const getRecognizerData = itemKey => {
+-	return async (dispatch, getState) => {
+-		const state = getState();
+-		const attachmentItem = state.libraries[state.current.libraryKey]?.items?.[itemKey];
+-		if (attachmentItem.contentType !== 'application/pdf') {
+-			throw new Error("Attachment is not a PDF");
+-		}
++const requestPDFRecognition = async (recognizerInputData, recognizerUrl) => {
++	const response = await fetch(`${recognizerUrl}/recognize`, {
++		method: 'POST', mode: 'cors', headers: { 'content-type': 'application/json' },
++		body: JSON.stringify(recognizerInputData)
++	});
++	if (!response.ok) throw new Error('Failed to recognize document');
++	return response.json();
++};
+ 
+-		const attachmentURL = await dispatch(getAttachmentUrl(itemKey));
+-		let response = await fetch(attachmentURL);
+-		if (response.status === 410) {
+-			const attachmentURL = await dispatch(getAttachmentUrl(itemKey, true));
+-			response = await fetch(attachmentURL);
++const getAttachmentMetadata = (itemKey, libraryKey, updateStage) => async (dispatch, getState) => {
++	const state = getState();
++	const attachmentItem = state.libraries[libraryKey]?.items?.[itemKey]
++		|| state.libraries[libraryKey]?.dataObjects?.[itemKey];
++	if (attachmentItem?.itemType !== 'attachment' || attachmentItem.deleted) {
++		throw new Error('The source attachment is not available.');
++	}
++	const format = attachmentFormat(attachmentItem);
++	let recognizedItem, warning;
++	if (format === 'pdf' && ['imported_file', 'imported_url'].includes(attachmentItem.linkMode)) {
++		const recognizerInputData = await dispatch(getRecognizerData(itemKey, libraryKey));
++		const attachmentResult = await retrieveNonPDFMetadata(attachmentItem, { translateUrl: state.config.translateUrl });
++		if (!attachmentResult.warning) {
++			({ metadata: recognizedItem, warning } = attachmentResult);
++			updateStage?.(1);
++		} else {
++			const hasText = recognizerInputData.pages.some(page => page?.[2]?.length);
++			const recognizerData = hasText
++				? await requestPDFRecognition(recognizerInputData, state.config.recognizerUrl)
++				: null;
++			updateStage?.(1);
++			recognizedItem = await dispatch(recognizePDF(recognizerData));
++			({ metadata: recognizedItem, warning } = supplementWeakPDFMetadata(
++				attachmentItem, recognizerInputData.metadata, recognizedItem
++			));
+ 		}
++	} else {
++		const result = await retrieveNonPDFMetadata(attachmentItem, {
++			readFile: () => dispatch(readAttachmentFile(itemKey, libraryKey)),
++			translateUrl: state.config.translateUrl,
++		});
++		({ metadata: recognizedItem, warning } = result);
++		updateStage?.(1);
++	}
++	if (!recognizedItem?.title) {
++		recognizedItem = basicAttachmentMetadata(attachmentItem);
++		warning = 'From file details; review and complete metadata';
++	}
++	if (!recognizedItem.title) throw new Error('No title found. Use manual entry.');
++	return { metadata: recognizedItem, warning, attachmentItem, format };
++};
+ 
+-		const data = await response.arrayBuffer();
+-		const { pdfWorkerURL, pdfReaderCMapsURL, pdfReaderStandardFontsURL, recognizerUrl } = state.config;
+-		const pdfWorker = new PDFWorker({ pdfWorkerURL, pdfReaderCMapsURL, pdfReaderStandardFontsURL });
+-		const recognizerInputData = await pdfWorker.getRecognizerData(data); // TODO: add suport for password-protected PDFs
+-		recognizerInputData.fileName = attachmentItem.filename;
+-
+-		const containingTextPages = recognizerInputData.pages.reduce((acc, page) => {
+-			if (page?.[2]?.length) {
+-				acc++;
+-			}
+-			return acc;
+-		}, 0);
+-
+-		if (containingTextPages === 0) {
+-			// TODO
+-			throw new Error('PDF does not contain any text');
+-		}
++const previewMetadataRefresh = (parentItemKey, libraryKey) => async (dispatch, getState) => {
++	const state = getState();
++	if (state.config.libraries.find(library => library.key === libraryKey)?.isReadOnly) {
++		throw new Error('This library is read-only.');
++	}
++	let objects = state.libraries[libraryKey]?.dataObjects || {};
++	const parentItem = state.libraries[libraryKey]?.items?.[parentItemKey] || objects[parentItemKey];
++	const attachmentKey = getMetadataAttachmentKey(parentItem, objects);
++	if (!attachmentKey) throw new Error('No attached file is available for metadata refresh.');
++	if (!objects[attachmentKey]) {
++		await dispatch(fetchItemsByKeys([attachmentKey], {}, { current: { libraryKey } }));
++		objects = getState().libraries[libraryKey]?.dataObjects || {};
++	}
++	const attachmentItem = findMetadataAttachment(parentItem, objects);
++	if (!attachmentItem) throw new Error('No attached file is available for metadata refresh.');
++	const { metadata, warning } = await dispatch(getAttachmentMetadata(attachmentItem.key, libraryKey));
++	const candidate = omit(metadata, ['key', 'version', 'attachments', 'notes', 'collections', 'relations', 'tags']);
++	return {
++		attachmentItem,
++		candidate,
++		changes: buildMetadataRefreshChanges(parentItem, candidate),
++		parentItem,
++		warning,
++	};
++};
+ 
+-		const url = `${recognizerUrl}/recognize`;
+-		const recognizerResponse = await fetch(url, {
+-			method: 'POST',
+-			mode: 'cors',
+-			headers: { 'content-type': 'application/json', },
+-			body: JSON.stringify(recognizerInputData)
+-		});
+-		if (recognizerResponse.ok) {
+-			return await recognizerResponse.json();
+-		} else {
+-			throw new Error('Failed to recognize document');
++const applyMetadataRefresh = (parentItemKey, candidate, selectedFields, libraryKey, previewParent) => async (dispatch, getState) => {
++	const state = getState();
++	if (state.config.libraries.find(library => library.key === libraryKey)?.isReadOnly) {
++		throw new Error('This library is read-only.');
++	}
++	const parentItem = state.libraries[libraryKey]?.items?.[parentItemKey];
++	if (!parentItem) throw new Error('The item is no longer available.');
++	if (!previewParent || buildMetadataRefreshChanges(previewParent, parentItem)
++		.some(change => selectedFields.includes(change.field) || change.field === 'itemType')) {
++		throw new Error('The item changed since this preview. Close and reopen Refresh Metadata before applying changes.');
++	}
++	const changes = buildMetadataRefreshChanges(parentItem, candidate);
++	const patch = buildMetadataRefreshPatch(changes, new Set(selectedFields));
++	const targetType = patch.itemType || parentItem.itemType;
++	const targetFields = state.meta.itemTypeFields[targetType]?.map(({ field }) => field);
++	if (targetFields) {
++		for (const field of Object.keys(patch)) {
++			if (!['itemType', 'creators'].includes(field) && !targetFields.includes(field)) {
++				// Empty removals of fields absent from the target type are implicit
++				// in a type change. Never silently drop a selected incoming value.
++				if (patch[field] !== '' && !(Array.isArray(patch[field]) && patch[field].length === 0)) {
++					throw new Error(`The selected field "${field}" is unavailable for ${targetType}. Select Item Type as well, or deselect this field.`);
++				}
++				delete patch[field];
++			}
+ 		}
+ 	}
+-}
+-
++	return Object.keys(patch).length ? dispatch(updateItem(parentItemKey, patch, libraryKey)) : parentItem;
++};
+ 
+ // create item based on data returned from recognizer
+ // based on https://github.com/zotero/zotero/blob/5fd94e22dff87318aa3a84e735e1fdece488f5e3/chrome/content/zotero/xpcom/recognizeDocument.js#L411
+@@ -101,6 +209,7 @@ const recognizePDF = (recognizerData) => {
+ 		const { translateUrl } = state.config;
+ 		let identifierPrefix = '';
+ 		let idenfitierValue = '';
++		if (!recognizerData) return null;
+ 		if (recognizerData.arxiv) {
+ 			identifierPrefix = 'arxiv';
+ 			idenfitierValue = recognizerData.arxiv;
+@@ -151,7 +260,7 @@ const recognizePDF = (recognizerData) => {
+ 
+ 			const newItem = {
+ 				itemType,
+-				creators: recognizerData.authors.map(author => ({
++				creators: (recognizerData.authors || []).map(author => ({
+ 					creatorType: 'author', ...pick(author, ['firstName', 'lastName'])
+ 				})),
+ 				title: recognizerData.title,
+@@ -192,7 +301,9 @@ const undoRetrieveMetadata = (itemKey, libraryKey) => {
+ 
+ 			const collections = item.collections;
+ 			await dispatch(updateItem(originalItemKey, { parentItem: false, title: originalTitle, collections }, libraryKey));
+-			await dispatch(renameAttachment(originalItemKey, originalFilename, libraryKey));
++			if (originalFilename && getState().libraries[libraryKey].items?.[originalItemKey]?.filename !== originalFilename) {
++				await dispatch(renameAttachment(originalItemKey, originalFilename, libraryKey));
++			}
+ 			await dispatch(deleteItem(item));
+ 			dispatch({
+ 				type: COMPLETE_UNRECOGNIZE_DOCUMENT,
+@@ -211,4 +322,4 @@ const undoRetrieveMetadata = (itemKey, libraryKey) => {
+ 	}
+ }
+ 
+-export { retrieveMetadata, undoRetrieveMetadata };
++export { applyMetadataRefresh, previewMetadataRefresh, retrieveMetadata, undoRetrieveMetadata };
+diff --git a/src/js/common/attachment-metadata.js b/src/js/common/attachment-metadata.js
+new file mode 100644
+index 00000000..9b0719d9
+--- /dev/null
++++ b/src/js/common/attachment-metadata.js
+@@ -0,0 +1,262 @@
++import { strFromU8, unzipSync } from 'fflate';
++import { omit } from 'web-common/utils';
++import { getZotero } from 'web-common/zotero';
++import { getItemFromIdentifier } from './identifiers';
++
++const MAX_FILE_BYTES = 64 * 1024 * 1024;
++const MAX_METADATA_BYTES = 2 * 1024 * 1024;
++const DC = 'http://purl.org/dc/elements/1.1/';
++const REFRESH_PROTECTED_FIELDS = new Set([
++	'key', 'version', 'dateAdded', 'dateModified', 'collections', 'relations', 'tags',
++	'attachments', 'notes', 'parentItem', 'deleted',
++]);
++
++// Recognition creates a parent. Never detach an attachment from an existing one.
++export const canRetrieveAttachmentMetadata = item => item?.itemType === 'attachment'
++	&& !item.parentItem && !item.deleted;
++
++const linkedAttachmentKey = parentItem => parentItem?.[Symbol.for('links')]
++	?.attachment?.href?.split('/').filter(Boolean).pop() || null;
++
++export const attachmentFormat = item => {
++	const type = (item.contentType || '').split(';')[0].toLowerCase();
++	const ext = (item.filename || '').split('.').pop().toLowerCase();
++	if (type === 'application/pdf' || ext === 'pdf') return 'pdf';
++	if (type === 'application/epub+zip' || ext === 'epub') return 'epub';
++	if (type === 'text/html' || type === 'application/xhtml+xml' || ['html', 'htm', 'xhtml'].includes(ext)) return 'html';
++	if (type.includes('officedocument.wordprocessingml') || ext === 'docx') return 'docx';
++	if (type === 'application/vnd.oasis.opendocument.text' || ext === 'odt') return 'odt';
++	if (type.startsWith('text/') || ['txt', 'md', 'csv'].includes(ext)) return 'text';
++	return 'other';
++};
++
++export const findMetadataAttachment = (parentItem, items = {}) => {
++	if (!parentItem || ['attachment', 'note', 'annotation'].includes(parentItem.itemType)) return null;
++	const linkedKey = linkedAttachmentKey(parentItem);
++	const linkedAttachment = linkedKey && items[linkedKey];
++	if (linkedAttachment?.itemType === 'attachment' && linkedAttachment.parentItem === parentItem.key && !linkedAttachment.deleted) {
++		return linkedAttachment;
++	}
++	const rank = { pdf: 0, epub: 1, html: 2, docx: 3, odt: 4, text: 5, other: 6 };
++	return Object.values(items)
++		.filter(item => item?.itemType === 'attachment' && item.parentItem === parentItem.key && !item.deleted)
++		.sort((a, b) => rank[attachmentFormat(a)] - rank[attachmentFormat(b)])[0] || null;
++};
++
++export const getMetadataAttachmentKey = (parentItem, items = {}) => {
++	if (!parentItem || ['attachment', 'note', 'annotation'].includes(parentItem.itemType)) return null;
++	return linkedAttachmentKey(parentItem) || findMetadataAttachment(parentItem, items)?.key || null;
++};
++
++const isEmptyMetadataValue = value => value === undefined || value === null || value === ''
++	|| (Array.isArray(value) && value.length === 0);
++const stableMetadataValue = value => {
++	if (Array.isArray(value)) return value.map(stableMetadataValue);
++	if (value && typeof value === 'object') return Object.fromEntries(
++		Object.keys(value).sort().map(key => [key, stableMetadataValue(value[key])])
++	);
++	return value;
++};
++const comparableMetadataValue = value => isEmptyMetadataValue(value) ? null : JSON.stringify(stableMetadataValue(value));
++
++export const buildMetadataRefreshChanges = (currentItem, candidate) => {
++	const priority = ['itemType', 'title', 'creators'];
++	const fields = [...new Set([
++		...priority,
++		...Object.keys(currentItem || {}),
++		...Object.keys(candidate || {}),
++	])].filter(field => !REFRESH_PROTECTED_FIELDS.has(field));
++	return fields.flatMap(field => {
++		const currentValue = currentItem?.[field];
++		const newValue = candidate?.[field];
++		if (comparableMetadataValue(currentValue) === comparableMetadataValue(newValue)) return [];
++		return [{
++			field, currentValue, newValue,
++			useNewByDefault: isEmptyMetadataValue(currentValue) && !isEmptyMetadataValue(newValue),
++		}];
++	});
++};
++
++export const buildMetadataRefreshPatch = (changes, selectedFields) => Object.fromEntries(
++	changes.filter(change => selectedFields.has(change.field)).map(change => [
++		change.field,
++		change.newValue === undefined || change.newValue === null
++			? (Array.isArray(change.currentValue) ? [] : '')
++			: change.newValue,
++	])
++);
++
++const parseXML = text => {
++	const doc = new DOMParser().parseFromString(text, 'application/xml');
++	if (doc.getElementsByTagName('parsererror').length) {
++		throw new Error('Could not read the file’s embedded metadata. Use Create Parent Item for manual entry.');
++	}
++	return doc;
++};
++const values = (doc, name) => [...doc.getElementsByTagNameNS(DC, name)]
++	.map(node => node.textContent.trim()).filter(Boolean);
++const creator = (name, creatorType = 'author') => getZotero().Utilities.cleanAuthor(name, creatorType, name.includes(','));
++
++// Extract only the requested metadata, never decompress the whole archive.
++const readZipText = (bytes, name) => {
++	const entries = unzipSync(bytes, { filter: entry => {
++		if (entry.name !== name) return false;
++		if (entry.originalSize > MAX_METADATA_BYTES) throw new Error('Embedded metadata is too large to read automatically.');
++		return true;
++	} });
++	return entries[name] ? strFromU8(entries[name]) : null;
++};
++
++export const extractEmbeddedMetadata = (data, format) => {
++	const bytes = new Uint8Array(data);
++	if (bytes.byteLength > MAX_FILE_BYTES) throw new Error('File is too large for automatic metadata extraction. Use an identifier or manual entry.');
++	if (['epub', 'docx', 'odt'].includes(format)) {
++		let name = format === 'docx' ? 'docProps/core.xml' : 'meta.xml';
++		if (format === 'epub') {
++			const container = readZipText(bytes, 'META-INF/container.xml');
++			if (!container) throw new Error('This EPUB has no metadata container. Use an identifier or manual entry.');
++			name = parseXML(container).getElementsByTagNameNS('*', 'rootfile')[0]?.getAttribute('full-path');
++		}
++		const text = name && readZipText(bytes, name);
++		if (!text) {
++			if (format === 'epub') throw new Error('This EPUB’s metadata package is missing. Use an identifier or manual entry.');
++			return { metadata: {}, identifierText: '' };
++		}
++		const doc = parseXML(text);
++		const metadata = {
++			itemType: format === 'epub' ? 'book' : 'document',
++			title: values(doc, 'title')[0],
++			creators: values(doc, 'creator').map(name => creator(name)),
++			language: values(doc, 'language')[0],
++			abstractNote: values(doc, 'description')[0],
++		};
++		if (format === 'epub') {
++			metadata.publisher = values(doc, 'publisher')[0];
++			metadata.date = values(doc, 'date')[0];
++			metadata.ISBN = getZotero().Utilities.extractIdentifiers(values(doc, 'identifier').join('\n')).find(id => id.ISBN)?.ISBN;
++			metadata.creators = [...doc.getElementsByTagNameNS(DC, 'creator')].map(node => {
++				const role = node.getAttributeNS('http://www.idpf.org/2007/opf', 'role')
++					|| [...doc.getElementsByTagNameNS('*', 'meta')].find(meta =>
++						meta.getAttribute('refines') === `#${node.id}` && meta.getAttribute('property') === 'role')?.textContent.trim();
++				return creator(node.textContent.trim(), role === 'trl' ? 'translator' : role === 'edt' ? 'editor' : 'author');
++			});
++		}
++		return { metadata, identifierText: values(doc, 'identifier').join('\n') };
++	}
++	const text = strFromU8(bytes).slice(0, MAX_METADATA_BYTES);
++	if (format === 'html') {
++		// DOMParser creates an inert document; never mount file markup in the page.
++		const doc = new DOMParser().parseFromString(text, 'text/html');
++		const meta = (...names) => [...doc.querySelectorAll('meta')]
++			.filter(node => names.includes((node.getAttribute('name') || node.getAttribute('property') || '').toLowerCase()))
++			.map(node => node.getAttribute('content')?.trim()).filter(Boolean);
++		const journal = meta('citation_journal_title')[0];
++		return {
++			metadata: {
++				itemType: journal ? 'journalArticle' : 'webpage',
++				title: meta('citation_title', 'dc.title', 'og:title')[0] || doc.title || undefined,
++				creators: meta('citation_author', 'dc.creator', 'author').map(name => creator(name)),
++				date: meta('citation_publication_date', 'dc.date')[0],
++				language: doc.documentElement.lang || undefined,
++				...(journal ? { publicationTitle: journal } : {}),
++			},
++			identifierText: meta('citation_doi', 'citation_isbn', 'dc.identifier').join('\n'),
++		};
++	}
++	return { metadata: {}, identifierText: text };
++};
++
++export const basicAttachmentMetadata = attachment => {
++	const type = attachment.contentType || '';
++	const format = attachmentFormat(attachment);
++	const itemType = format === 'epub' ? 'book' : format === 'html' || attachment.linkMode === 'linked_url' ? 'webpage'
++		: type.startsWith('image/') ? 'artwork' : type.startsWith('audio/') ? 'audioRecording'
++			: type.startsWith('video/') ? 'videoRecording' : 'document';
++	const title = (attachment.title || attachment.filename || '').trim();
++	return {
++		itemType,
++		title: title === attachment.filename ? title.replace(/\.[^.]+$/, '') : title,
++		...(attachment.url ? { url: attachment.url } : {}),
++	};
++};
++
++export const supplementWeakPDFMetadata = (attachment, pdfMetadata = {}, recognizedItem) => {
++	const hasBibliographicMetadata = recognizedItem && (
++		recognizedItem.creators?.length
++		|| ['DOI', 'ISBN', 'ISSN', 'publicationTitle', 'bookTitle', 'publisher', 'date', 'url']
++			.some(field => recognizedItem[field])
++	);
++	if (hasBibliographicMetadata) return { metadata: recognizedItem, warning: null };
++	const author = (pdfMetadata.Author || '').trim();
++	const creators = !author || /^(?:none|unknown|anonymous)$/i.test(author) ? [] : author
++		.split(/\s*;\s*/).filter(Boolean).map(name => {
++			const corporate = !name.includes(',') && (name.split(/\s+/).length === 1 || /^[A-Z0-9& .'-]+$/.test(name));
++			return corporate ? { creatorType: 'author', name } : creator(name);
++		});
++	const embedded = Object.fromEntries(Object.entries({
++		itemType: 'document',
++		title: pdfMetadata.Title?.trim(),
++		creators,
++		abstractNote: pdfMetadata.Subject?.trim(),
++		language: pdfMetadata.Language?.trim(),
++		publisher: pdfMetadata.EBX_PUBLISHER?.trim(),
++	}).filter(([, value]) => value !== undefined && value !== ''));
++	const remote = Object.fromEntries(Object.entries(omit(recognizedItem || {}, ['itemType', 'creators']))
++		.filter(([, value]) => value !== undefined && value !== ''));
++	const metadata = { ...basicAttachmentMetadata(attachment), ...embedded, ...remote, itemType: 'document', creators };
++	return { metadata, warning: 'From embedded PDF metadata; review details' };
++};
++
++const titleMatchScore = (reference, candidate) => {
++	const words = value => new Set(String(value || '').normalize('NFKD').toLowerCase()
++		.replace(/[\u0300-\u036f]/g, '').match(/[\p{L}\p{N}]+/gu) || []);
++	const expected = words(reference);
++	const actual = words(candidate);
++	if (!expected.size || !actual.size) return 0;
++	const overlap = [...expected].filter(word => actual.has(word)).length;
++	return (2 * overlap) / (expected.size + actual.size);
++};
++
++export const retrieveNonPDFMetadata = async (attachment, { readFile, translateUrl }) => {
++	const format = attachmentFormat(attachment);
++	let embedded = { metadata: {}, identifierText: '' };
++	if (['epub', 'html', 'docx', 'odt', 'text'].includes(format)
++		&& ['imported_file', 'imported_url'].includes(attachment.linkMode)) {
++		embedded = extractEmbeddedMetadata(await readFile(), format);
++	}
++	const text = [embedded.identifierText, attachment.url, attachment.title, attachment.filename].filter(Boolean).join('\n');
++	const identifiers = getZotero().Utilities.extractIdentifiers(text)
++		// Bare eight-digit filenames are not evidence of PubMed records.
++		.filter(id => !id.PMID || /(?:PMID\s*:?|pubmed\.ncbi\.nlm\.nih\.gov\/)/i.test(text))
++		.filter((identifier, index, all) => {
++			const value = JSON.stringify(identifier);
++			return all.findIndex(other => JSON.stringify(other) === value) === index;
++		});
++	const referenceTitle = embedded.metadata.title || basicAttachmentMetadata(attachment).title;
++	let bestMatch = null;
++	for (const identifier of identifiers.slice(0, 5)) {
++		try {
++			const [kind, value] = Object.entries(identifier)[0];
++			const item = await getItemFromIdentifier(`${kind}: ${value}`, translateUrl);
++			if (item?.title && item.itemType && !['attachment', 'note', 'annotation'].includes(item.itemType)) {
++				// Translation results may carry attachment suggestions; the original file is retained.
++				const metadata = omit(item, ['key', 'version', 'attachments', 'notes']);
++				const score = titleMatchScore(referenceTitle, metadata.title);
++				if (!bestMatch || score > bestMatch.score) bestMatch = { metadata, score };
++				// An exact title match cannot be improved by later identifiers.
++				if (score === 1) break;
++			}
++		} catch {
++			// Embedded fields remain useful when the lookup service is unavailable.
++		}
++	}
++	if (bestMatch) return { metadata: bestMatch.metadata, warning: null };
++	const basic = basicAttachmentMetadata(attachment);
++	const fields = Object.fromEntries(Object.entries(embedded.metadata).filter(([, value]) => value !== undefined && value !== ''));
++	const metadata = { ...basic, ...fields, title: fields.title || basic.title };
++	if (!metadata.title) throw new Error('No title or metadata found. Use Create Parent Item for manual entry.');
++	return {
++		metadata,
++		warning: fields.title ? 'From embedded metadata; review details' : 'From file details; review and complete metadata',
++	};
++};
+diff --git a/src/js/component/item/actions.jsx b/src/js/component/item/actions.jsx
+index 07111674..170545c4 100644
+--- a/src/js/component/item/actions.jsx
++++ b/src/js/component/item/actions.jsx
+@@ -10,7 +10,7 @@ import ExportActions from './actions/export';
+ import UploadAction from './actions/upload';
+ import columnProperties from '../../constants/column-properties';
+ import AddByIdentifier from './actions/add-by-identifier';
+-import { useCanRecognize, useCanReparent, useItemActionHandlers } from '../../hooks';
++import { useCanRecognize, useCanRefreshMetadata, useCanReparent, useItemActionHandlers } from '../../hooks';
+ import { currentGoToSubscribeUrl, toggleSelectMode } from '../../actions';
+ import { MoreActionsDropdownDesktop } from './actions/more-actions.jsx';
+ 
+@@ -133,6 +133,7 @@ const ItemActionsDesktop = memo(props => {
+ 	const isMyPublications = useSelector(state => state.current.isMyPublications);
+ 	const selectedCount = useSelector(state => state.current.itemKeys.length);
+ 	const canRecognize = useCanRecognize();
++	const canRefreshMetadata = useCanRefreshMetadata();
+ 	const canReparent = useCanReparent();
+ 
+ 	const selectedContainsCollection = useSelector(
+@@ -144,7 +145,7 @@ const ItemActionsDesktop = memo(props => {
+ 
+ 	const { handleCiteModalOpen, handleNewItemCreate, handleNewStandaloneNote, handleAddToCollectionModalOpen,
+ 		handleRemoveFromCollection, handleTrash, handlePermanentlyDelete, handleUndelete,
+-		handleBibliographyModalOpen, handleRetrieveMetadata, handleChangeParentItemModalOpen } = useItemActionHandlers();
++			handleBibliographyModalOpen, handleRefreshMetadata, handleRetrieveMetadata, handleChangeParentItemModalOpen } = useItemActionHandlers();
+ 
+ 	const handleKeyDown = useCallback(ev => {
+ 		if (ev.target !== ev.currentTarget) {
+@@ -215,12 +216,12 @@ const ItemActionsDesktop = memo(props => {
+ 							<Fragment>
+ 								{isRecognizerAvailable && (
+ 									<Button
+-										disabled={!canRecognize}
++										disabled={!canRecognize && !canRefreshMetadata}
+ 										icon
+-										onClick={handleRetrieveMetadata}
++										onClick={canRefreshMetadata ? handleRefreshMetadata : handleRetrieveMetadata}
+ 										onKeyDown={handleKeyDown}
+ 										tabIndex={-2}
+-										title="Retrieve Metadata"
++										title={canRefreshMetadata ? "Refresh Metadata" : "Retrieve Metadata"}
+ 									>
+ 										<Icon type="16/retrieve-metadata" width="16" height="16" />
+ 									</Button>
+diff --git a/src/js/component/item/actions/more-actions.jsx b/src/js/component/item/actions/more-actions.jsx
+index ac56d2b1..df347af2 100644
+--- a/src/js/component/item/actions/more-actions.jsx
++++ b/src/js/component/item/actions/more-actions.jsx
+@@ -12,8 +12,8 @@ import { setModalFocusRestore } from '../../../common/modal-focus-restore';
+ const MoreActionsItems = ({ divider = false, toggleRef }) => {
+ 	const dispatch = useDispatch();
+ 	const isTouchOrSmall = useSelector(state => state.device.isTouchOrSmall);
+-	const { handleDuplicate, handleRetrieveMetadata, handleUnrecognize, handleCreateParentItem, handleChangeParentItemModalOpen } = useItemActionHandlers();
+-	const { attachmentContentType, canDuplicate, canCreateParent, canRecognize, canReparent, canUnregonize, doi, isViewFile,
++	const { handleDuplicate, handleRefreshMetadata, handleRetrieveMetadata, handleUnrecognize, handleCreateParentItem, handleChangeParentItemModalOpen } = useItemActionHandlers();
++	const { attachmentContentType, canDuplicate, canCreateParent, canRecognize, canRefreshMetadata, canReparent, canUnregonize, doi, isViewFile,
+ 		isViewOnline, item, selectedCount, url } = useItemsActions();
+ 
+ 	const isRecognizerAvailable = useSelector(state => state.config.isRecognizerAvailable);
+@@ -69,13 +69,18 @@ const MoreActionsItems = ({ divider = false, toggleRef }) => {
+ 				</DropdownItem>
+ 			)}
+ 
+-			{canDuplicate && (canRecognize || canCreateParent || canUnregonize) && <DropdownItem divider />}
++			{canDuplicate && (canRecognize || canRefreshMetadata || canCreateParent || canUnregonize) && <DropdownItem divider />}
+ 
+ 			{(isTouchOrSmall && isRecognizerAvailable && canRecognize) && (
+ 				<DropdownItem onClick={handleRetrieveMetadata}>
+ 					Retrieve Metadata
+ 				</DropdownItem>
+ 			)}
++			{(isTouchOrSmall && isRecognizerAvailable && canRefreshMetadata) && (
++				<DropdownItem onClick={handleRefreshMetadata}>
++					Refresh Metadata
++				</DropdownItem>
++			)}
+ 			{canCreateParent && (
+ 				<DropdownItem onClick={handleCreateParentItemDropdownClick}>
+ 					{selectedCount === 1 ? "Create Parent Item" : "Create Parent Items"}
+@@ -91,7 +96,7 @@ const MoreActionsItems = ({ divider = false, toggleRef }) => {
+ 					Undo Retrieve Metadata
+ 				</DropdownItem>
+ 			)}
+-			{divider && (isViewFile || isViewOnline || canDuplicate || (isTouchOrSmall && isRecognizerAvailable && canRecognize) || canCreateParent || canUnregonize) && <DropdownItem divider />}
++			{divider && (isViewFile || isViewOnline || canDuplicate || (isTouchOrSmall && isRecognizerAvailable && (canRecognize || canRefreshMetadata)) || canCreateParent || canUnregonize) && <DropdownItem divider />}
+ 		</Fragment>
+ 	);
+ }
+diff --git a/src/js/component/modal-manager.jsx b/src/js/component/modal-manager.jsx
+index 6f057c25..98934d31 100644
+--- a/src/js/component/modal-manager.jsx
++++ b/src/js/component/modal-manager.jsx
+@@ -15,6 +15,7 @@ import IdentifierPicker from './modal/identifier-picker';
+ import ItemsSortModal from './modal/items-sort';
+ import ManageTagsModal from './modal/manage-tags';
+ import metadataRetrieval from './modal/metadata-retrieval';
++import MetadataRefreshModal from './modal/metadata-refresh';
+ import MoveCollectionsModal from './modal/move-collections';
+ import NewCollectionModal from './modal/new-collection';
+ import NewItemModal from './modal/new-item';
+@@ -25,7 +26,7 @@ import StyleInstallerModal from './modal/style-installer';
+ import {
+ 	ADD_BY_IDENTIFIER, ADD_LINKED_URL_TOUCH, ADD_RELATED, BIBLIOGRAPHY, CHANGE_PARENT_ITEM, COLLECTION_ADD,
+ 	COLLECTION_RENAME, COLLECTION_SELECT, COPY_CITATION, CREATE_PARENT_ITEM, EXPORT, IDENTIFIER_PICKER,
+-	MANAGE_TAGS, METADATA_RETRIEVAL, MOVE_COLLECTION, NEW_ITEM, SETTINGS, SORT_ITEMS, STYLE_INSTALLER
++		MANAGE_TAGS, METADATA_REFRESH, METADATA_RETRIEVAL, MOVE_COLLECTION, NEW_ITEM, SETTINGS, SORT_ITEMS, STYLE_INSTALLER
+ } from '../constants/modals';
+ 
+ const lookup = {
+@@ -43,6 +44,7 @@ const lookup = {
+ 	[IDENTIFIER_PICKER]: IdentifierPicker,
+ 	[MANAGE_TAGS]: ManageTagsModal,
+ 	[METADATA_RETRIEVAL]: metadataRetrieval,
++	[METADATA_REFRESH]: MetadataRefreshModal,
+ 	[MOVE_COLLECTION]: MoveCollectionsModal,
+ 	[NEW_ITEM]: NewItemModal,
+ 	[SETTINGS]: SettingsModal,
+diff --git a/src/js/component/modal/create-parent-item.jsx b/src/js/component/modal/create-parent-item.jsx
+index cf433093..a61fd17c 100644
+--- a/src/js/component/modal/create-parent-item.jsx
++++ b/src/js/component/modal/create-parent-item.jsx
+@@ -5,9 +5,10 @@ import { useDispatch, useSelector } from 'react-redux';
+ import { usePrevious, useFocusManager } from 'web-common/hooks';
+ import { getZotero } from 'web-common/zotero';
+ 
++import { useCanRecognize } from '../../hooks/use-items-actions';
+ import Input from '../form/input';
+ import Modal from '../ui/modal';
+-import { CREATE_PARENT_ITEM } from '../../constants/modals';
++import { CREATE_PARENT_ITEM, METADATA_RETRIEVAL } from '../../constants/modals';
+ import { focusOnModalOpen } from '../../common/modal-focus';
+ import {
+ 	createEmptyParentItems, createParentItemFromIdentifier, dismissErrorByTag, navigate,
+@@ -26,7 +27,8 @@ const CreateParentItemModal = () => {
+ 	const inputEl = useRef(null);
+ 	const footerRef = useRef(null);
+ 	const id = useId();
+-	const [isBusy, setIsBusy] = useState(itemKeys.length > 1);
++	const [isBusy, setIsBusy] = useState(false);
++	const canRecognize = useCanRecognize();
+ 	const [identifier, setIdentifier] = useState('');
+ 	const skipNextFocusRef = useRef(false); // required for modal's scopedTab (focus trap) to work correctly
+ 	const { focusNext, focusPrev, receiveBlur, receiveFocus, resetLastFocused } = useFocusManager(
+@@ -81,7 +83,7 @@ const CreateParentItemModal = () => {
+ 		setIsBusy(true);
+ 		try {
+ 			const parentItems = await dispatch(createEmptyParentItems(itemKeys, libraryKey));
+-			if (parentItems.length === 1) {
++			if (parentItems?.length === 1) {
+ 				dispatch(triggerSelectMode(false));
+ 				dispatch(navigate({ items: [parentItems[0].key], noteKey: null, attachmentKey: null, view: 'item-details' }, false));
+ 			}
+@@ -90,17 +92,9 @@ const CreateParentItemModal = () => {
+ 		}
+ 	}, [dispatch, itemKeys, libraryKey]);
+ 
+-	const handleTriggeredForMultipleItems = useCallback(async () => {
+-		try {
+-			const newItems = await dispatch(createEmptyParentItems(itemKeys, libraryKey));
+-			if (newItems.length > 0) {
+-				dispatch(triggerSelectMode(true));
+-				dispatch(navigate({ items: newItems.map(i => i.key), noteKey: null, attachmentKey: null, view: 'item-list' }, false));
+-			}
+-		} finally {
+-			dispatch(toggleModal(CREATE_PARENT_ITEM, false));
+-		}
+-	}, [dispatch, itemKeys, libraryKey]);
++	const handleAutomatic = useCallback(() => {
++		dispatch(toggleModal(METADATA_RETRIEVAL, true, { recognizeSelected: true }));
++	}, [dispatch]);
+ 
+ 	const handleFocus = useCallback((ev) => {
+ 		if (skipNextFocusRef.current) {
+@@ -140,13 +134,10 @@ const CreateParentItemModal = () => {
+ 
+ 	useEffect(() => {
+ 		if (isOpen && !wasOpen) {
+-			if (itemKeys.length > 1) {
+-				handleTriggeredForMultipleItems();
+-			} else {
+-				setIsBusy(false);
+-			}
++			setIsBusy(false);
++			setIdentifier('');
+ 		}
+-	}, [handleTriggeredForMultipleItems, isOpen, itemKeys.length, wasOpen]);
++	}, [isOpen, wasOpen]);
+ 
+ 	return (
+ 		<Modal
+@@ -172,7 +163,7 @@ const CreateParentItemModal = () => {
+ 							</div>
+ 							<div className="modal-header-right">
+ 								<Button
+-									disabled={identifier === ''}
++									disabled={isBusy || itemKeys.length !== 1 || identifier === ''}
+ 									className="btn-link"
+ 									onClick={handleAddClick}
+ 								>
+@@ -200,6 +191,11 @@ const CreateParentItemModal = () => {
+ 			<div
+ 				className="modal-body"
+ 			>
++				<p>Automatically find metadata in the file or look up its identifiers. If no match is found, create a basic parent from the file details for you to complete.</p>
++				<Button className="btn btn-outline-secondary" onClick={handleAutomatic} disabled={isBusy || !canRecognize}>
++					Automatic
++				</Button>
++				{itemKeys.length === 1 && <Fragment>
+ 				<h3>
+ 					<label htmlFor={`${id}-input`}>
+ 						Enter a DOI, ISBN, PMID, arXiv ID, or ADS Bibcode to identify this file:
+@@ -219,6 +215,7 @@ const CreateParentItemModal = () => {
+ 						/>
+ 					</div>
+ 				</div>
++				</Fragment>}
+ 			</div>
+ 			<div
+ 				className="modal-footer"
+@@ -236,7 +233,7 @@ const CreateParentItemModal = () => {
+ 				{!isTouchOrSmall && (
+ 					<div className="modal-footer-right">
+ 						<Button
+-							disabled={identifier === ''}
++							disabled={isBusy || itemKeys.length !== 1 || identifier === ''}
+ 							className="btn btn-link"
+ 							onClick={handleAddClick}
+ 							tabIndex={-2}
+diff --git a/src/js/component/modal/metadata-refresh.jsx b/src/js/component/modal/metadata-refresh.jsx
+new file mode 100644
+index 00000000..3b2f70aa
+--- /dev/null
++++ b/src/js/component/modal/metadata-refresh.jsx
+@@ -0,0 +1,143 @@
++import cx from 'classnames';
++import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
++import { Button, Icon, Spinner } from 'web-common/components';
++import { useDispatch, useSelector } from 'react-redux';
++
++import Modal from '../ui/modal';
++import { applyMetadataRefresh, previewMetadataRefresh, toggleModal } from '../../actions';
++import { focusOnModalOpen } from '../../common/modal-focus';
++import { METADATA_REFRESH } from '../../constants/modals';
++
++const EMPTY = <span className="metadata-refresh-empty">Empty</span>;
++
++const MetadataRefreshModal = () => {
++	const dispatch = useDispatch();
++	const isOpen = useSelector(state => state.modal.id === METADATA_REFRESH);
++	const parentItemKey = useSelector(state => state.modal.parentItemKey);
++	const libraryKey = useSelector(state => state.modal.libraryKey);
++	const isTouchOrSmall = useSelector(state => state.device.isTouchOrSmall);
++	const itemFields = useSelector(state => state.meta.itemFields);
++	const itemTypes = useSelector(state => state.meta.itemTypes);
++	const closeButtonRef = useRef(null);
++	const [preview, setPreview] = useState(null);
++	const [selectedFields, setSelectedFields] = useState(new Set());
++	const [isLoading, setIsLoading] = useState(false);
++	const [isApplying, setIsApplying] = useState(false);
++	const [error, setError] = useState(null);
++
++	useEffect(() => {
++		if (!isOpen) return undefined;
++		let active = true;
++		setPreview(null);
++		setSelectedFields(new Set());
++		setError(null);
++		setIsLoading(true);
++		dispatch(previewMetadataRefresh(parentItemKey, libraryKey)).then(result => {
++			if (!active) return;
++			setPreview(result);
++			setSelectedFields(new Set(result.changes.filter(change => change.useNewByDefault).map(change => change.field)));
++		}).catch(reason => {
++			if (active) setError(reason?.message || 'Metadata could not be refreshed.');
++		}).finally(() => {
++			if (active) setIsLoading(false);
++		});
++		return () => { active = false; };
++	}, [dispatch, isOpen, libraryKey, parentItemKey]);
++
++	const fieldLabels = useMemo(() => Object.fromEntries(itemFields.map(({ field, localized }) => [field, localized])), [itemFields]);
++	const itemTypeLabels = useMemo(() => Object.fromEntries(itemTypes.map(({ itemType, localized }) => [itemType, localized])), [itemTypes]);
++	const getFieldLabel = useCallback(field => field === 'itemType' ? 'Item Type'
++		: field === 'creators' ? 'Creators'
++			: fieldLabels[field] || field.replace(/([a-z])([A-Z])/g, '$1 $2').replace(/^./, value => value.toUpperCase()), [fieldLabels]);
++	const formatValue = useCallback((field, value) => {
++		if (value === undefined || value === null || value === '' || (Array.isArray(value) && value.length === 0)) return EMPTY;
++		if (field === 'itemType') return itemTypeLabels[value] || value;
++		if (field === 'creators') return value.map(creator => creator.name
++			|| [creator.firstName, creator.lastName].filter(Boolean).join(' ')).filter(Boolean).join('; ') || EMPTY;
++		if (Array.isArray(value)) return value.map(entry => typeof entry === 'string' ? entry : JSON.stringify(entry)).join('; ');
++		if (typeof value === 'object') return JSON.stringify(value);
++		return String(value);
++	}, [itemTypeLabels]);
++
++	const handleCancel = useCallback(() => {
++		if (!isApplying) dispatch(toggleModal());
++	}, [dispatch, isApplying]);
++	const handleAfterOpen = useCallback(({ contentEl }) => {
++		focusOnModalOpen(contentEl, isTouchOrSmall, () => closeButtonRef.current?.focus({ preventScroll: true }));
++	}, [isTouchOrSmall]);
++	const toggleField = useCallback(field => {
++		setSelectedFields(current => {
++			const next = new Set(current);
++			if (next.has(field)) next.delete(field);
++			else next.add(field);
++			return next;
++		});
++	}, []);
++	const applyFields = useCallback(async fields => {
++		if (!preview || fields.length === 0) return;
++		setError(null);
++		setIsApplying(true);
++		try {
++			await dispatch(applyMetadataRefresh(parentItemKey, preview.candidate, fields, libraryKey, preview.parentItem));
++			dispatch(toggleModal());
++		} catch (reason) {
++			setError(reason?.message || 'The selected metadata could not be applied.');
++			setIsApplying(false);
++		}
++	}, [dispatch, libraryKey, parentItemKey, preview]);
++	const handleApplySelected = useCallback(() => applyFields([...selectedFields]), [applyFields, selectedFields]);
++	const handleUseAllNew = useCallback(() => applyFields(preview?.changes.map(change => change.field) || []), [applyFields, preview]);
++
++	return (
++		<Modal
++			className="metadata-refresh-modal"
++			contentLabel="Refresh Metadata"
++			isOpen={isOpen}
++			onAfterOpen={handleAfterOpen}
++			onRequestClose={handleCancel}
++			overlayClassName={cx('modal-centered', { 'modal-slide': isTouchOrSmall })}
++			shouldCloseOnEsc={!isApplying}
++			shouldCloseOnOverlayClick={!isApplying}
++		>
++			<Fragment>
++				<div className="modal-header">
++					<h4 className="modal-title truncate">Refresh Metadata</h4>
++					<Button icon className="close" disabled={isApplying} onClick={handleCancel} ref={closeButtonRef} title="Close Dialog">
++						<Icon type="16/close" width="16" height="16" />
++					</Button>
++				</div>
++				<div className="modal-body">
++					{isLoading && <div className="metadata-refresh-status" role="status"><Spinner /> Looking up metadata...</div>}
++					{error && <div className="alert alert-danger" role="alert">{error}</div>}
++					{preview?.warning && <div className="alert alert-warning">{preview.warning}</div>}
++					{preview && preview.changes.length === 0 && <div role="status">Metadata is already up to date.</div>}
++					{preview?.changes.length > 0 && (
++						<div className="metadata-refresh-table-wrap">
++							<table className="metadata-refresh-table">
++								<thead><tr><th scope="col">Use New</th><th scope="col">Field</th><th scope="col">Current</th><th scope="col">New</th></tr></thead>
++								<tbody>{preview.changes.map(change => {
++									const label = getFieldLabel(change.field);
++									return <tr key={change.field}>
++										<td><input type="checkbox" aria-label={`Use new ${label}`} checked={selectedFields.has(change.field)} disabled={isApplying} onChange={() => toggleField(change.field)} /></td>
++										<th scope="row">{label}</th>
++										<td>{formatValue(change.field, change.currentValue)}</td>
++										<td>{formatValue(change.field, change.newValue)}</td>
++									</tr>;
++								})}</tbody>
++							</table>
++						</div>
++					)}
++				</div>
++				<div className="modal-footer">
++					<div className="modal-footer-left"><Button className="btn btn-link" disabled={isApplying} onClick={handleCancel}>Cancel</Button></div>
++					<div className="modal-footer-right">
++						<Button className="btn btn-outline-secondary" disabled={isLoading || isApplying || !preview?.changes.length} onClick={handleUseAllNew}>Use All New</Button>
++						<Button className="btn btn-primary" disabled={isLoading || isApplying || selectedFields.size === 0} onClick={handleApplySelected}>Apply Selected</Button>
++					</div>
++				</div>
++			</Fragment>
++		</Modal>
++	);
++};
++
++export default memo(MetadataRefreshModal);
+diff --git a/src/js/component/modal/metadata-retrieval.jsx b/src/js/component/modal/metadata-retrieval.jsx
+index 85142f15..712f1c88 100644
+--- a/src/js/component/modal/metadata-retrieval.jsx
++++ b/src/js/component/modal/metadata-retrieval.jsx
+@@ -245,7 +245,7 @@ const MetadataRetrievalModal = () => {
+ 			key: item.itemKey,
+ 			title: item.itemTitle,
+ 			parentItemKey: item.parentItemKey,
+-			parentItemTitle: item.completed ? item.parentItemTitle : item.error ? 'Error' : 'Processing',
++			parentItemTitle: item.completed ? [item.parentItemTitle, item.warning].filter(Boolean).join(" — ") : item.error || 'Processing',
+ 			iconName,
+ 			completed: item.completed,
+ 			error: item.error,
+@@ -284,7 +284,7 @@ const MetadataRetrievalModal = () => {
+ 				dispatch(currentRetrieveMetadata());
+ 				// unselect items to be recognized. If recognition is successful, the items will become child items and thus disappear from the list
+ 				setTimeout(() => {
+-					dispatch(navigate({items: []}));
++					dispatch(navigate({items: [], attachmentKey: null, noteKey: null}));
+ 				}, 0);
+ 			}
+ 		} else if (!isOpen && wasOpen) {
+diff --git a/src/js/constants/modals.js b/src/js/constants/modals.js
+index bb79388c..4bc60254 100644
+--- a/src/js/constants/modals.js
++++ b/src/js/constants/modals.js
+@@ -13,6 +13,7 @@ export const EXPORT = 'EXPORT';
+ export const IDENTIFIER_PICKER = 'IDENTIFIER_PICKER';
+ export const MANAGE_TAGS = 'MANAGE_TAGS';
+ export const METADATA_RETRIEVAL = 'METADATA_RETRIEVAL';
++export const METADATA_REFRESH = 'METADATA_REFRESH';
+ export const MOVE_COLLECTION = 'MOVE COLLECTION';
+ export const NEW_ITEM = 'NEW_ITEM';
+ export const SETTINGS = 'SETTINGS';
+diff --git a/src/js/hooks/use-item-action-handlers.js b/src/js/hooks/use-item-action-handlers.js
+index 732dab05..6bb17f16 100644
+--- a/src/js/hooks/use-item-action-handlers.js
++++ b/src/js/hooks/use-item-action-handlers.js
+@@ -1,5 +1,5 @@
+ import { useCallback } from 'react';
+-import { useDispatch } from 'react-redux';
++import { useDispatch, useSelector } from 'react-redux';
+ import {
+ 	currentAddToCollectionModal, currentBibliographyModal, currentCiteModal,
+ 	currentCreateItemOfType, currentDeletePermanently, currentDuplicateItem, currentExportItemsModal,
+@@ -7,10 +7,12 @@ import {
+ 	currentUndoRetrieveMetadata, navigate, toggleItemsSortingDirection, toggleModal, triggerEditingItem,
+ 	triggerSelectMode
+ } from '../actions';
+-import { ADD_BY_IDENTIFIER, CREATE_PARENT_ITEM, METADATA_RETRIEVAL, SORT_ITEMS, CHANGE_PARENT_ITEM } from '../constants/modals';
++import { ADD_BY_IDENTIFIER, CREATE_PARENT_ITEM, METADATA_REFRESH, METADATA_RETRIEVAL, SORT_ITEMS, CHANGE_PARENT_ITEM } from '../constants/modals';
+ 
+ const useItemActionHandlers = () => {
+ 	const dispatch = useDispatch();
++	const libraryKey = useSelector(state => state.current.libraryKey);
++	const selectedItemKey = useSelector(state => state.current.itemKeys[0]);
+ 	const handleAddToCollectionModalOpen = useCallback(() => {
+ 		dispatch(currentAddToCollectionModal());
+ 	}, [dispatch]);
+@@ -85,6 +87,10 @@ const useItemActionHandlers = () => {
+ 		dispatch(toggleModal(METADATA_RETRIEVAL, true, { recognizeSelected: true }));
+ 	}, [dispatch]);
+ 
++	const handleRefreshMetadata = useCallback(() => {
++		dispatch(toggleModal(METADATA_REFRESH, true, { libraryKey, parentItemKey: selectedItemKey }));
++	}, [dispatch, libraryKey, selectedItemKey]);
++
+ 	const handleCreateParentItem = useCallback(() => {
+ 		dispatch(toggleModal(CREATE_PARENT_ITEM, true, { createParentItem: true }));
+ 	}, [dispatch]);
+@@ -101,7 +107,7 @@ const useItemActionHandlers = () => {
+ 	return { handleAddByIdentifierModalOpen, handleAddToCollectionModalOpen, handleBibliographyModalOpen,
+ 		handleCiteModalOpen, handleCreateParentItem, handleDuplicate, handleExportModalOpen,
+ 		handleNewItemCreate, handleNewItemModalOpen, handleNewStandaloneNote, handlePermanentlyDelete,
+-		handleRemoveFromCollection, handleRetrieveMetadata, handleSortModalOpen, handleSortOrderToggle,
++		handleRefreshMetadata, handleRemoveFromCollection, handleRetrieveMetadata, handleSortModalOpen, handleSortOrderToggle,
+ 		handleTrash, handleUndelete, handleUnrecognize, handleChangeParentItemModalOpen
+ 	};
+ }
+diff --git a/src/js/hooks/use-items-actions.js b/src/js/hooks/use-items-actions.js
+index db04298a..33c6382e 100644
+--- a/src/js/hooks/use-items-actions.js
++++ b/src/js/hooks/use-items-actions.js
+@@ -2,31 +2,43 @@ import { useSelector } from 'react-redux';
+ import { getZotero } from 'web-common/zotero';
+ 
+ import { cleanURL } from '../utils';
++import { canRetrieveAttachmentMetadata, getMetadataAttachmentKey } from '../common/attachment-metadata';
+ 
+ const useCanRecognize = () => {
+ 	const isReadOnly = useSelector(state => (state.config.libraries.find(l => l.key === state.current.libraryKey) || {}).isReadOnly);
+ 	const isTrash = useSelector(state => state.current.isTrash);
+ 	const isMyPublications = useSelector(state => state.current.isMyPublications);
+ 	const selectedCount = useSelector(state => state.current.itemKeys.length);
+-	const selectedItemsAreStoredPDFs = useSelector(state => state.current.itemKeys.every(
+-		key => state.libraries[state.current.libraryKey]?.dataObjects?.[key]?.itemType === 'attachment'
+-			&& state.libraries[state.current.libraryKey]?.dataObjects?.[key]?.linkMode === 'imported_file'
+-			&& state.libraries[state.current.libraryKey]?.dataObjects?.[key]?.contentType === 'application/pdf'
++	const selectedItemsAreAttachments = useSelector(state => state.current.itemKeys.every(
++		key => canRetrieveAttachmentMetadata(state.libraries[state.current.libraryKey]?.dataObjects?.[key])
+ 	));
+-	const canRecognize = !isTrash && !isMyPublications && !isReadOnly && selectedCount > 0 && selectedItemsAreStoredPDFs;
++	const canRecognize = !isTrash && !isMyPublications && !isReadOnly && selectedCount > 0 && selectedItemsAreAttachments;
+ 	return canRecognize;
+ };
+ 
+ const useCanCreateParent = () => {
++	const isReadOnly = useSelector(state => (state.config.libraries.find(l => l.key === state.current.libraryKey) || {}).isReadOnly);
+ 	const isTrash = useSelector(state => state.current.isTrash);
+ 	const isMyPublications = useSelector(state => state.current.isMyPublications);
+ 	const selectedItemsAreAllAttachments = useSelector(state => state.current.itemKeys.length > 0 && state.current.itemKeys.every(
+-		key => state.libraries[state.current.libraryKey]?.dataObjects?.[key]?.itemType === 'attachment'
++		key => canRetrieveAttachmentMetadata(state.libraries[state.current.libraryKey]?.dataObjects?.[key])
+ 	));
+-	const canCreateParent = !isTrash && !isMyPublications && selectedItemsAreAllAttachments;
++	const canCreateParent = !isTrash && !isMyPublications && !isReadOnly && selectedItemsAreAllAttachments;
+ 	return canCreateParent;
+ };
+ 
++const useCanRefreshMetadata = () => {
++	const isReadOnly = useSelector(state => (state.config.libraries.find(l => l.key === state.current.libraryKey) || {}).isReadOnly);
++	const isTrash = useSelector(state => state.current.isTrash);
++	const isMyPublications = useSelector(state => state.current.isMyPublications);
++	const canRefresh = useSelector(state => {
++		if (state.current.itemKeys.length !== 1) return false;
++		const objects = state.libraries[state.current.libraryKey]?.dataObjects || {};
++		return !!getMetadataAttachmentKey(objects[state.current.itemKeys[0]], objects);
++	});
++	return !isTrash && !isMyPublications && !isReadOnly && canRefresh;
++};
++
+ const useCanReparent = () => {
+ 	const isReadOnly = useSelector(state => (state.config.libraries.find(l => l.key === state.current.libraryKey) || {}).isReadOnly);
+ 	const isTrash = useSelector(state => state.current.isTrash);
+@@ -68,13 +80,14 @@ const useItemsActions = () => {
+ 	const canReparent = useCanReparent();
+ 	const canCreateParent = useCanCreateParent();
+ 	const canRecognize = useCanRecognize();
++	const canRefreshMetadata = useCanRefreshMetadata();
+ 	const canUnregonize = useCanUnrecognize();
+ 
+-	const hasAnyAction = isViewFile || isViewOnline || canDuplicate || canRecognize || canUnregonize || canCreateParent;
++	const hasAnyAction = isViewFile || isViewOnline || canDuplicate || canRecognize || canRefreshMetadata || canUnregonize || canCreateParent;
+ 	return {
+-		attachmentContentType, canDuplicate, canCreateParent, canRecognize, canReparent, canUnregonize, doi, hasAnyAction,
++		attachmentContentType, canDuplicate, canCreateParent, canRecognize, canRefreshMetadata, canReparent, canUnregonize, doi, hasAnyAction,
+ 		isReadOnly, isViewFile, isTrash, isMyPublications, isViewOnline, item, selectedCount, url
+ 	};
+ };
+ 
+-export { useItemsActions, useCanRecognize, useCanCreateParent, useCanReparent, useCanUnrecognize };
++export { useItemsActions, useCanRecognize, useCanCreateParent, useCanRefreshMetadata, useCanReparent, useCanUnrecognize };
+diff --git a/src/js/reducers/recognize.js b/src/js/reducers/recognize.js
+index c4999c32..731efd44 100644
+--- a/src/js/reducers/recognize.js
++++ b/src/js/reducers/recognize.js
+@@ -35,7 +35,7 @@ const recognize = (state = getDefaultState(), action, globalState) => {
+ 					{
+ 						itemKey: action.itemKey,
+ 						itemTitle: getBaseMappedValue(
+-							globalState?.meta?.mappings, globalState.libraries[globalState.current.libraryKey]?.items?.[action.itemKey], 'title'
++							globalState?.meta?.mappings, globalState.libraries[action.libraryKey]?.items?.[action.itemKey], 'title'
+ 						),
+ 						libraryKey: action.libraryKey,
+ 						stage: 0,
+@@ -66,9 +66,10 @@ const recognize = (state = getDefaultState(), action, globalState) => {
+ 							...entry,
+ 							parentItemKey: action.parentItemKey,
+ 							parentItemTitle: getBaseMappedValue(
+-								globalState?.meta?.mappings, globalState.libraries[globalState.current.libraryKey]?.items?.[action.parentItemKey], 'title'
++								globalState?.meta?.mappings, globalState.libraries[action.libraryKey]?.items?.[action.parentItemKey], 'title'
+ 							),
+ 							completed: true,
++							warning: action.warning,
+ 						};
+ 					}
+ 					return entry;
+diff --git a/src/scss/components/modal/_metadata-refresh.scss b/src/scss/components/modal/_metadata-refresh.scss
+new file mode 100644
+index 00000000..ed6cdb28
+--- /dev/null
++++ b/src/scss/components/modal/_metadata-refresh.scss
+@@ -0,0 +1,61 @@
++@use "../../abstracts/mixins/breakpoints";
++
++.metadata-refresh-modal {
++	@include breakpoints.mouse-and-bp-up(md) {
++		width: min(880px, calc(100vw - 48px));
++	}
++
++	.modal-body {
++		min-height: 180px;
++	}
++
++	.metadata-refresh-status {
++		display: flex;
++		gap: 8px;
++		align-items: center;
++		justify-content: center;
++		min-height: 140px;
++	}
++
++	.metadata-refresh-table-wrap {
++		max-height: min(58vh, 520px);
++		overflow: auto;
++	}
++
++	.metadata-refresh-table {
++		width: 100%;
++		border-collapse: collapse;
++		table-layout: fixed;
++
++		th,
++		td {
++			padding: 8px;
++			border-bottom: 1px solid var(--fill-quinary);
++			vertical-align: top;
++			text-align: left;
++			overflow-wrap: anywhere;
++			white-space: pre-wrap;
++		}
++
++		th:first-child,
++		td:first-child {
++			width: 76px;
++			text-align: center;
++		}
++
++		th:nth-child(2),
++		td:nth-child(2) {
++			width: 140px;
++		}
++	}
++
++	.metadata-refresh-empty {
++		color: var(--fill-secondary);
++		font-style: italic;
++	}
++
++	.modal-footer-right {
++		display: flex;
++		gap: 8px;
++	}
++}
+diff --git a/src/scss/zotero-web-library.scss b/src/scss/zotero-web-library.scss
+index 187be4ec..7f263338 100644
+--- a/src/scss/zotero-web-library.scss
++++ b/src/scss/zotero-web-library.scss
+@@ -82,6 +82,7 @@
+ @use "components/modal/identifier-picker";
+ @use "components/modal/manage-tags";
+ @use "components/modal/metadata-retrieval";
++@use "components/modal/metadata-refresh";
+ @use "components/modal/modal-item-picker";
+ @use "components/drag-layer";
+ @use "components/rich-editor";
+@@ -92,4 +93,3 @@
+ @use "components/crash-handler";
+ @use "components/reader";
+ 
+-
+diff --git a/test/attachment-metadata.test.js b/test/attachment-metadata.test.js
+new file mode 100644
+index 00000000..ad47110b
+--- /dev/null
++++ b/test/attachment-metadata.test.js
+@@ -0,0 +1,174 @@
++import { zipSync, strToU8 } from 'fflate';
++import { configureZoteroShim } from 'web-common/zotero';
++import schema from 'zotero-schema/schema.json';
++import {
++ attachmentFormat, buildMetadataRefreshChanges, buildMetadataRefreshPatch,
++ canRetrieveAttachmentMetadata, extractEmbeddedMetadata, findMetadataAttachment, getMetadataAttachmentKey,
++ retrieveNonPDFMetadata
++} from '../src/js/common/attachment-metadata';
++import { getItemFromIdentifier } from '../src/js/common/identifiers';
++
++jest.mock('../src/js/common/identifiers');
++const xml = '<metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>The Diving Bell and the Butterfly</dc:title><dc:creator>Jean-Dominique Bauby</dc:creator><dc:publisher>Knopf Doubleday Publishing Group</dc:publisher><dc:date>2008-03-06</dc:date><dc:identifier>9780307454836</dc:identifier><dc:language>en</dc:language></metadata>';
++const epub = () => zipSync({
++ 'META-INF/container.xml': strToU8('<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles><rootfile full-path="BOOK/book.opf"/></rootfiles></container>'),
++ 'BOOK/book.opf': strToU8(xml),
++ 'BOOK/cover.jpg': new Uint8Array(32),
++});
++const attachment = { itemType: 'attachment', linkMode: 'imported_file', contentType: 'application/epub+zip', title: 'book.epub', filename: 'book.epub' };
++beforeEach(() => {
++ configureZoteroShim(schema, { locale: 'en-US', formatMessage: ({ id }) => id });
++ getItemFromIdentifier.mockReset();
++});
++
++test('reads EPUB metadata and ISBN from the declared package', () => {
++ const result = extractEmbeddedMetadata(epub(), 'epub');
++ expect(result.metadata).toMatchObject({ itemType: 'book', title: 'The Diving Bell and the Butterfly', publisher: 'Knopf Doubleday Publishing Group', date: '2008-03-06', language: 'en', creators: [{ firstName: 'Jean-Dominique', lastName: 'Bauby', creatorType: 'author' }] });
++ expect(result.identifierText).toBe('9780307454836');
++});
++
++test('uses an ISBN lookup and excludes suggested additional attachments', async () => {
++ getItemFromIdentifier.mockResolvedValue({ itemType: 'book', title: 'Catalog title', attachments: [{}], notes: [{}] });
++ const result = await retrieveNonPDFMetadata(attachment, { readFile: async () => epub(), translateUrl: '/translate' });
++ expect(getItemFromIdentifier).toHaveBeenCalledWith('ISBN: 9780307454836', '/translate');
++ expect(result).toEqual({ metadata: { itemType: 'book', title: 'Catalog title' }, warning: null });
++});
++
++test('retains embedded book fields when lookup fails or returns no result', async () => {
++ for (const response of [undefined, { itemType: 'attachment', title: 'not a parent' }]) {
++  getItemFromIdentifier.mockResolvedValue(response);
++  const result = await retrieveNonPDFMetadata(attachment, { readFile: async () => epub(), translateUrl: '/translate' });
++  expect(result.metadata.title).toBe('The Diving Bell and the Butterfly');
++  expect(result.warning).toContain('embedded metadata');
++ }
++ getItemFromIdentifier.mockRejectedValue(new Error('offline'));
++ expect((await retrieveNonPDFMetadata(attachment, { readFile: async () => epub() })).metadata.itemType).toBe('book');
++});
++
++test('reads DOCX and ODT metadata without treating file creation time as publication date', () => {
++ for (const [format, path] of [['docx', 'docProps/core.xml'], ['odt', 'meta.xml']]) {
++  const result = extractEmbeddedMetadata(zipSync({ [path]: strToU8(xml) }), format);
++  expect(result.metadata.itemType).toBe('document');
++  expect(result.metadata.creators[0].lastName).toBe('Bauby');
++  expect(result.metadata.date).toBeUndefined();
++ }
++});
++
++test('reads HTML citation metadata and does not execute scripts', () => {
++ const result = extractEmbeddedMetadata(strToU8('<html><head><meta name="citation_title" content="Research"><meta name="citation_author" content="Ada Lovelace"><meta name="citation_doi" content="10.1234/example"><meta name="citation_journal_title" content="Journal"><script>window.metadataScriptRan=true</script></head></html>'), 'html');
++ expect(result.metadata).toMatchObject({ title: 'Research', itemType: 'journalArticle', publicationTitle: 'Journal' });
++ expect(result.identifierText).toBe('10.1234/example');
++ expect(window.metadataScriptRan).toBeUndefined();
++});
++
++test('all other types get a labeled basic parent without downloading binary content', async () => {
++ const readFile = jest.fn();
++ for (const [contentType, filename, itemType] of [['image/png', 'Drawing.png', 'artwork'], ['audio/mpeg', 'Interview.mp3', 'audioRecording'], ['video/mp4', 'Lecture.mp4', 'videoRecording'], ['application/octet-stream', 'Archive.bin', 'document']]) {
++  const result = await retrieveNonPDFMetadata({ ...attachment, contentType, filename, title: filename }, { readFile });
++  expect(result.metadata).toEqual({ itemType, title: filename.replace(/\.[^.]+$/, '') });
++  expect(result.warning).toContain('file details');
++ }
++ expect(readFile).not.toHaveBeenCalled();
++});
++
++test('linked files and URLs use available identifiers without trying browser file access', async () => {
++ const readFile = jest.fn();
++ getItemFromIdentifier.mockResolvedValue({ itemType: 'book', title: 'Matched book' });
++ const result = await retrieveNonPDFMetadata({ ...attachment, linkMode: 'linked_file', filename: '9780307454836.epub' }, { readFile });
++ expect(result.metadata.title).toBe('Matched book');
++ expect(readFile).not.toHaveBeenCalled();
++});
++
++test('does not mistake an eight digit filename for a PubMed identifier', async () => {
++ const result = await retrieveNonPDFMetadata({ ...attachment, contentType: 'image/jpeg', filename: '20260925.jpg', title: '20260925.jpg' }, {});
++ expect(result.metadata.title).toBe('20260925');
++ expect(getItemFromIdentifier).not.toHaveBeenCalled();
++});
++
++test('chooses the identifier result that best matches the document instead of the first citation', async () => {
++ const paper = {
++  ...attachment,
++  contentType: 'text/markdown',
++  title: 'Housing First and Recovery Outcomes.md',
++  filename: 'Housing First and Recovery Outcomes.md',
++ };
++ getItemFromIdentifier.mockImplementation(identifier => Promise.resolve(
++  identifier.includes('10.1000/incidental')
++   ? { itemType: 'journalArticle', title: 'An Incidental Work Cited in the Paper', DOI: '10.1000/incidental' }
++   : { itemType: 'journalArticle', title: 'Housing First and Recovery Outcomes', DOI: '10.2000/target' }
++ ));
++ const result = await retrieveNonPDFMetadata(paper, {
++  readFile: async () => strToU8('# Housing First and Recovery Outcomes\n\nPrior work (10.1000/incidental) informed this study.\n\nDOI: 10.2000/target'),
++  translateUrl: '/translate',
++ });
++ expect(getItemFromIdentifier).toHaveBeenCalledTimes(2);
++ expect(result.metadata).toMatchObject({ title: 'Housing First and Recovery Outcomes', DOI: '10.2000/target' });
++});
++
++test('bad EPUB packages and invalid XML fail with useful errors instead of creating false metadata', () => {
++ expect(() => extractEmbeddedMetadata(strToU8('not a zip'), 'epub')).toThrow();
++ expect(() => extractEmbeddedMetadata(zipSync({}), 'epub')).toThrow('metadata container');
++ const bad = zipSync({ 'META-INF/container.xml': strToU8('<invalid') });
++ expect(() => extractEmbeddedMetadata(bad, 'epub')).toThrow('embedded metadata');
++});
++
++test('rejects oversized metadata before decompressing it', () => {
++ const archive = zipSync({ 'docProps/core.xml': strToU8('x'.repeat(2 * 1024 * 1024 + 1)) });
++ expect(() => extractEmbeddedMetadata(archive, 'docx')).toThrow('too large');
++});
++
++test('detects mislabeled EPUBs by extension; existing parents, notes, and deleted items are excluded', () => {
++ expect(attachmentFormat({ ...attachment, contentType: 'application/octet-stream' })).toBe('epub');
++ expect(canRetrieveAttachmentMetadata(attachment)).toBe(true);
++ expect(canRetrieveAttachmentMetadata({ ...attachment, parentItem: 'PARENT12' })).toBe(false);
++ expect(canRetrieveAttachmentMetadata({ ...attachment, deleted: 1 })).toBe(false);
++ expect(canRetrieveAttachmentMetadata({ itemType: 'note' })).toBe(false);
++});
++
++test('compares bibliographic metadata without offering to replace user-managed data', () => {
++ const current = {
++  itemType: 'journalArticle', title: 'Current title', abstractNote: 'Keep this summary', DOI: '',
++  creators: [{ creatorType: 'author', firstName: 'Current', lastName: 'Author' }],
++  tags: [{ tag: 'keep-me' }], collections: ['COLLECTION'], relations: { related: ['x'] },
++  dateAdded: '2026-01-01T00:00:00Z', version: 12,
++ };
++ const candidate = {
++  itemType: 'journalArticle', title: 'New title', DOI: '10.1234/new',
++  creators: [{ creatorType: 'author', firstName: 'New', lastName: 'Author' }],
++  tags: [{ tag: 'automatic' }], collections: [],
++ };
++ const changes = buildMetadataRefreshChanges(current, candidate);
++ expect(changes.map(change => change.field)).toEqual(['title', 'creators', 'abstractNote', 'DOI']);
++ expect(changes.find(change => change.field === 'DOI').useNewByDefault).toBe(true);
++ expect(changes.find(change => change.field === 'title').useNewByDefault).toBe(false);
++ expect(changes.find(change => change.field === 'abstractNote')).toMatchObject({ newValue: undefined, useNewByDefault: false });
++ expect(changes.map(change => change.field)).not.toEqual(expect.arrayContaining(['tags', 'collections', 'relations', 'dateAdded', 'version']));
++});
++
++test('builds either a selective refresh patch or a complete new metadata patch', () => {
++ const changes = buildMetadataRefreshChanges(
++  { itemType: 'journalArticle', title: 'Current', abstractNote: 'Old summary', DOI: '' },
++  { itemType: 'journalArticle', title: 'New', DOI: '10.1234/new' }
++ );
++ expect(buildMetadataRefreshPatch(changes, new Set(['DOI']))).toEqual({ DOI: '10.1234/new' });
++ expect(buildMetadataRefreshPatch(changes, new Set(changes.map(change => change.field)))).toEqual({
++  title: 'New', abstractNote: '', DOI: '10.1234/new'
++ });
++});
++
++test('finds the preferred attachment for an existing parent item', () => {
++ const pdf = { key: 'PDF12345', itemType: 'attachment', parentItem: 'PARENT1', contentType: 'application/pdf' };
++ const snapshot = { key: 'HTML1234', itemType: 'attachment', parentItem: 'PARENT1', contentType: 'text/html' };
++ const parent = { key: 'PARENT1', itemType: 'journalArticle', [Symbol.for('links')]: {
++  attachment: { href: 'https://api.zotero.org/users/1/items/PDF12345', attachmentType: 'application/pdf' }
++ } };
++ expect(findMetadataAttachment(parent, { HTML1234: snapshot, PDF12345: pdf })).toBe(pdf);
++});
++
++test('finds a parent attachment key before the attachment record has loaded', () => {
++ const parent = { key: 'PARENT1', itemType: 'journalArticle', [Symbol.for('links')]: {
++  attachment: { href: 'https://api.zotero.org/users/1/items/PDF12345', attachmentType: 'application/pdf' }
++ } };
++ expect(getMetadataAttachmentKey(parent)).toBe('PDF12345');
++ expect(findMetadataAttachment(parent)).toBeNull();
++});
+diff --git a/test/metadata-workflows.test.jsx b/test/metadata-workflows.test.jsx
+new file mode 100644
+index 00000000..8ad11acc
+--- /dev/null
++++ b/test/metadata-workflows.test.jsx
+@@ -0,0 +1,345 @@
++/* @jest-environment ./test/utils/zotero-env.js */
++import '@testing-library/jest-dom';
++import { http, HttpResponse } from 'msw';
++import { setupServer } from 'msw/node';
++import { screen, within, waitFor } from '@testing-library/react';
++import userEvent from '@testing-library/user-event';
++import { zipSync, strToU8 } from 'fflate';
++import { configureZoteroShim } from 'web-common/zotero';
++import schema from 'zotero-schema/schema.json';
++import { renderWithProviders } from './utils/render';
++import { JSONtoState } from './utils/state';
++import { setupMSWLifecycle } from './utils/msw-lifecycle';
++import { applyAdditionalJestTweaks, waitForPosition } from './utils/common';
++import CreateParentItemModal from '../src/js/component/modal/create-parent-item';
++import MetadataRefreshModal from '../src/js/component/modal/metadata-refresh';
++import { CREATE_PARENT_ITEM, METADATA_REFRESH } from '../src/js/constants/modals';
++import { MainZotero } from '../src/js/component/main';
++import { ItemActionsDesktop } from '../src/js/component/item/actions';
++import { setupStore } from '../src/js/store';
++import { applyMetadataRefresh, previewMetadataRefresh, retrieveMetadata, undoRetrieveMetadata } from '../src/js/actions/recognize';
++import { useCanRecognize, useCanCreateParent, useCanRefreshMetadata } from '../src/js/hooks/use-items-actions';
++import { PDFWorker } from '../src/js/common/pdf-worker.js';
++import stateRaw from './fixtures/state/desktop-test-user-top-level-attachment-view.json';
++
++jest.mock('../src/js/common/pdf-worker.js');
++
++const key = 'UMPPCXU4';
++const api = 'https://api.zotero.org/users/1/items';
++const epub = zipSync({
++ 'META-INF/container.xml': strToU8('<container><rootfiles><rootfile full-path="book.opf"/></rootfiles></container>'),
++ 'book.opf': strToU8('<metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Sample Book</dc:title><dc:creator>Ada Lovelace</dc:creator></metadata>'),
++});
++const makeState = (patch = {}) => {
++ const state = JSONtoState(stateRaw);
++ for (const field of ['items', 'dataObjects']) {
++  Object.assign(state.libraries.u1[field][key], { title: 'Sample.epub', filename: 'Sample.epub', contentType: 'application/epub+zip', tags: [{ tag: 'keep-me' }], ...patch });
++ }
++ return state;
++};
++const makeRefreshState = () => {
++ const state = makeState({ parentItem: 'PARENT1' });
++ const parent = {
++  key: 'PARENT1', version: 1, itemType: 'book', title: 'Current title',
++  creators: [{ creatorType: 'author', firstName: 'Ada', lastName: 'Lovelace' }],
++  publisher: 'Current publisher', abstractNote: '', language: '',
++  collections: ['CSB4KZUU'], tags: [{ tag: 'keep-parent-tag' }], relations: { related: ['KEEP'] },
++  [Symbol.for('links')]: { attachment: { href: `${api}/${key}`, attachmentType: 'application/epub+zip' } },
++ };
++ for (const field of ['items', 'dataObjects']) state.libraries.u1[field].PARENT1 = parent;
++ state.current.itemKey = 'PARENT1';
++ state.current.itemKeys = ['PARENT1'];
++ state.modal = { id: METADATA_REFRESH, parentItemKey: 'PARENT1', libraryKey: 'u1' };
++ return state;
++};
++const server = setupServer(
++ http.get(`${api}/NEWBOOK1/children`, () => HttpResponse.json([], { headers: { 'Total-Results': '0' } })),
++ http.get(api, () => HttpResponse.json([], { headers: { 'Total-Results': '0' } })),
++ http.get(`${api}/${key}/file/view/url`, () => HttpResponse.text('https://files.zotero.net/sample.epub')),
++ http.get('https://files.zotero.net/sample.epub', () => HttpResponse.arrayBuffer(epub.buffer)),
++ http.get('https://api.zotero.org/users/1/collections/CSB4KZUU/items/top/tags', () => HttpResponse.json([], { headers: { 'Total-Results': '0' } })),
++);
++applyAdditionalJestTweaks();
++setupMSWLifecycle(server);
++beforeEach(() => {
++ window.jsdom.reconfigure({ url: `http://localhost/testuser/collections/CSB4KZUU/items/${key}` });
++ configureZoteroShim(schema, { locale: 'en-US', formatMessage: ({ id }) => id });
++});
++const mockWrites = ({ renameFails = false } = {}) => {
++ const created = [], patches = [], filenames = [];
++ let version = 300;
++ server.use(
++  http.post(api, async ({ request }) => {
++   const [data] = await request.json();
++   created.push(data);
++   const record = { key: 'NEWBOOK1', version: ++version, library: { type: 'user', id: 1, name: 'testuser', links: {} }, links: {}, meta: {}, data: { ...data, key: 'NEWBOOK1', version, tags: data.tags || [] } };
++   return HttpResponse.json({ successful: { 0: record }, success: { 0: 'NEWBOOK1' }, unchanged: {}, failed: {} }, { headers: { 'Last-Modified-Version': String(version) } });
++  }),
++  http.patch(`${api}/${key}`, async ({ request }) => {
++   patches.push(await request.json());
++   return new HttpResponse(null, { status: 204, headers: { 'Last-Modified-Version': String(++version) } });
++  }),
++  http.post(`${api}/${key}/file`, async ({ request }) => {
++   filenames.push(new URLSearchParams(await request.text()).get('filename'));
++   return renameFails ? new HttpResponse(null, { status: 500 }) : HttpResponse.json({ exists: 1 });
++  }),
++  http.delete(`${api}/NEWBOOK1`, () => new HttpResponse(null, { status: 204, headers: { 'Last-Modified-Version': String(++version) } })),
++ );
++ return { created, patches, filenames };
++};
++
++test('Automatic creates a book from EPUB, preserves the attachment key/tags, and supports undo', async () => {
++ const calls = mockWrites();
++ const { store } = renderWithProviders(<MainZotero />, { preloadedState: makeState() });
++ await waitForPosition();
++ const user = userEvent.setup();
++ expect(screen.getByRole('button', { name: 'Retrieve Metadata' })).toBeEnabled();
++ await user.click(within(screen.getByRole('toolbar', { name: 'items toolbar' })).getByRole('button', { name: 'More' }));
++ await waitForPosition();
++ await user.click(screen.getByRole('menuitem', { name: 'Create Parent Item' }));
++ const dialog = await screen.findByRole('dialog', { name: 'Create Parent Item' });
++ expect(calls.created).toHaveLength(0);
++ await user.click(within(dialog).getByRole('button', { name: 'Automatic' }));
++ await screen.findByRole('dialog', { name: 'Metadata Retrieval' });
++ await waitFor(() => expect(store.getState().recognize.entries[0]?.completed).toBe(true));
++ expect(calls.created[0]).toMatchObject({ itemType: 'book', title: 'Sample Book', collections: ['CSB4KZUU'] });
++ expect(calls.patches[0]).toMatchObject({ parentItem: 'NEWBOOK1', title: 'EPUB', collections: [] });
++ expect(calls.filenames[0]).toMatch(/\.epub$/);
++ expect(store.getState().libraries.u1.items[key].tags).toEqual([{ tag: 'keep-me' }]);
++ await store.dispatch(undoRetrieveMetadata('NEWBOOK1', 'u1'));
++ expect(calls.patches[1]).toMatchObject({ parentItem: false, title: 'Sample.epub', collections: ['CSB4KZUU'] });
++ expect(calls.filenames[1]).toBe('Sample.epub');
++});
++
++test('the metadata toolbar glyph remains visible when no eligible item is selected', async () => {
++ const state = makeState();
++ state.current.itemKey = null;
++ state.current.itemKeys = [];
++ renderWithProviders(<ItemActionsDesktop onFocusNext={jest.fn()} onFocusPrev={jest.fn()} onFocusBySelector={jest.fn()} />, { preloadedState: state });
++ expect(screen.getByRole('button', { name: 'Retrieve Metadata' })).toBeDisabled();
++});
++
++test('Retrieve Metadata creates a marked basic parent for an unknown file type without renaming it', async () => {
++ const calls = mockWrites();
++ const store = setupStore(makeState({ title: 'Example.xyz', filename: 'Example.xyz', contentType: 'application/octet-stream' }));
++ await store.dispatch(retrieveMetadata(key, 'u1', 'test-task'));
++ expect(calls.created[0]).toMatchObject({ title: 'Example', itemType: 'document' });
++ expect(calls.filenames).toHaveLength(0);
++ expect(store.getState().recognize.entries[0].warning).toContain('file details');
++});
++
++test('PDF filename ISBN takes priority over an incidental DOI from the recognizer', async () => {
++ const calls = mockWrites();
++ const identifiers = [];
++ let recognizerCalled = false;
++ const filename = 'The Strengths Perspective -- isbn13 9780801333101 -- archive.pdf';
++ const pdfState = makeState({ title: filename, filename, contentType: 'application/pdf' });
++ PDFWorker.mockImplementation(() => ({ getRecognizerData: () => ({
++  metadata: { Title: 'The strengths perspective in social work practice' },
++  totalPages: 324,
++  pages: [[612, 792, [[[[[0, 0, 0, 0, [[[[0, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 'book']]]]]]]]]]],
++ }) }));
++ server.use(
++  http.post('https://localhost/translate/search', async ({ request }) => {
++   const identifier = await request.text();
++   identifiers.push(identifier);
++   return HttpResponse.json(identifier.startsWith('ISBN')
++    ? [{ itemType: 'book', title: 'The Strengths Perspective in Social Work Practice', ISBN: '9780801333101' }]
++    : [{ itemType: 'bookSection', title: 'Incidental chapter', DOI: '10.4324/9781003178699-44' }]);
++  }),
++  http.post('https://localhost/recognize/recognize', () => {
++   recognizerCalled = true;
++   return HttpResponse.json({ type: 'journal-article', title: 'The strengths perspective in social work practice', authors: [], doi: '10.4324/9781003178699-44' });
++  }),
++ );
++ const store = setupStore(pdfState);
++ await store.dispatch(retrieveMetadata(key, 'u1', 'test-task'));
++ expect(identifiers).toEqual(['ISBN: 9780801333101']);
++ expect(recognizerCalled).toBe(false);
++ expect(calls.created[0]).toMatchObject({ itemType: 'book', title: 'The Strengths Perspective in Social Work Practice', ISBN: '9780801333101' });
++});
++
++test('weak PDF recognition falls back to embedded PDF metadata', async () => {
++ const calls = mockWrites();
++ const title = 'TIP 57 Trauma-Informed Care in Behavioral Health Services';
++ const pdfState = makeState({ title: 'TIP-57.pdf', filename: 'TIP-57.pdf', contentType: 'application/pdf' });
++ PDFWorker.mockImplementation(() => ({ getRecognizerData: () => ({
++  metadata: { Title: title, Author: 'SAMHSA', Subject: 'Trauma-Informed Care in Behavioral Health Services', Language: 'EN-US' },
++  totalPages: 360,
++  pages: [[612, 792, [[[[[0, 0, 0, 0, [[[[0, 0, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0, 'TIP']]]]]]]]]]],
++ }) }));
++ server.use(http.post('https://localhost/recognize/recognize', () => HttpResponse.json({
++  type: 'journal-article', title, authors: [], language: 'en',
++ })));
++ const store = setupStore(pdfState);
++ await store.dispatch(retrieveMetadata(key, 'u1', 'test-task'));
++ expect(calls.created[0]).toMatchObject({
++  itemType: 'document', title, language: 'en',
++  creators: [{ creatorType: 'author', name: 'SAMHSA' }],
++  abstractNote: 'Trauma-Informed Care in Behavioral Health Services',
++ });
++ expect(store.getState().recognize.entries[0].warning).toBe('From embedded PDF metadata; review details');
++});
++
++test('download failure gives an actionable error and creates no parent', async () => {
++ const calls = mockWrites();
++ server.use(http.get('https://files.zotero.net/sample.epub', () => new HttpResponse(null, { status: 404 })));
++ const store = setupStore(makeState());
++ await store.dispatch(retrieveMetadata(key, 'u1', 'test-task'));
++ expect(calls.created).toHaveLength(0);
++ expect(store.getState().recognize.entries[0].error).toContain('404');
++});
++
++test('rename failure does not report a failed retrieval or allow a duplicate parent', async () => {
++ const calls = mockWrites({ renameFails: true });
++ const store = setupStore(makeState());
++ await store.dispatch(retrieveMetadata(key, 'u1', 'test-task'));
++ expect(store.getState().recognize.entries[0]).toMatchObject({ completed: true, warning: 'Parent created; the file could not be renamed' });
++ await store.dispatch(retrieveMetadata(key, 'u1', 'test-task'));
++ expect(calls.created).toHaveLength(1);
++});
++
++test('duplicate concurrent requests create only one parent', async () => {
++ const calls = mockWrites();
++ const store = setupStore(makeState());
++ await Promise.all([store.dispatch(retrieveMetadata(key, 'u1', 'task')), store.dispatch(retrieveMetadata(key, 'u1', 'task'))]);
++ expect(calls.created).toHaveLength(1);
++ expect(calls.patches).toHaveLength(1);
++});
++
++const Eligibility = () => <div><button disabled={!useCanRecognize()}>Retrieve</button><button disabled={!useCanCreateParent()}>Parent</button><button disabled={!useCanRefreshMetadata()}>Refresh</button></div>;
++test.each(['read-only', 'parented', 'trash'])('%s selections cannot retrieve or create parents', kind => {
++ const state = makeState(kind === 'parented' ? { parentItem: 'EXISTING' } : {});
++ if (kind === 'read-only') state.config.libraries.find(l => l.key === 'u1').isReadOnly = true;
++ if (kind === 'trash') state.current.isTrash = true;
++ renderWithProviders(<Eligibility />, { preloadedState: state });
++ expect(screen.getByRole('button', { name: 'Retrieve' })).toBeDisabled();
++ expect(screen.getByRole('button', { name: 'Parent' })).toBeDisabled();
++});
++
++test('an existing parent can refresh metadata before its attachment record has loaded', () => {
++ const state = makeState({ parentItem: 'PARENT1' });
++ const parent = {
++  key: 'PARENT1', version: 1, itemType: 'book', title: 'Current title', creators: [],
++  collections: ['CSB4KZUU'], tags: [{ tag: 'keep-parent-tag' }], relations: {},
++  [Symbol.for('links')]: { attachment: { href: `${api}/${key}`, attachmentType: 'application/epub+zip' } },
++ };
++ for (const field of ['items', 'dataObjects']) state.libraries.u1[field].PARENT1 = parent;
++ delete state.libraries.u1.items[key];
++ delete state.libraries.u1.dataObjects[key];
++ state.current.itemKey = 'PARENT1';
++ state.current.itemKeys = ['PARENT1'];
++ renderWithProviders(<Eligibility />, { preloadedState: state });
++ expect(screen.getByRole('button', { name: 'Refresh' })).toBeEnabled();
++ expect(screen.getByRole('button', { name: 'Retrieve' })).toBeDisabled();
++});
++
++test('metadata refresh loads a linked attachment record on demand', async () => {
++ const state = makeRefreshState();
++ const attachmentItem = state.libraries.u1.items[key];
++ // A loaded fallback must not prevent loading the explicitly linked file.
++ for (const field of ['items', 'dataObjects']) {
++  state.libraries.u1[field].FALLBACK = { ...attachmentItem, key: 'FALLBACK', filename: 'fallback.txt', contentType: 'text/plain' };
++ }
++ delete state.libraries.u1.items[key];
++ delete state.libraries.u1.dataObjects[key];
++ let fetchedAttachment = false;
++ server.use(http.get(api, ({ request }) => {
++  if (new URL(request.url).searchParams.get('itemKey') !== key) {
++   return HttpResponse.json([], { headers: { 'Total-Results': '0' } });
++  }
++  fetchedAttachment = true;
++  return HttpResponse.json([{
++   key, version: attachmentItem.version,
++   library: { type: 'user', id: 1, name: 'testuser', links: {} },
++   links: {
++    self: { href: `${api}/${key}`, type: 'application/json' },
++    up: { href: `${api}/PARENT1`, type: 'application/json' },
++    enclosure: { href: `${api}/${key}/file/view`, type: 'application/epub+zip' },
++   },
++   meta: {},
++   data: { ...attachmentItem, parentItem: 'PARENT1' },
++  }], { headers: { 'Total-Results': '1', 'Last-Modified-Version': String(attachmentItem.version) } });
++ }));
++ const store = setupStore(state);
++ const preview = await store.dispatch(previewMetadataRefresh('PARENT1', 'u1'));
++ expect(fetchedAttachment).toBe(true);
++ expect(preview.attachmentItem.key).toBe(key);
++ expect(preview.candidate.title).toBe('Sample Book');
++ expect(store.getState().libraries.u1.items[key]).toMatchObject({ key, parentItem: 'PARENT1' });
++});
++
++test('metadata refresh rejects stale selected fields and incompatible incoming fields before writing', async () => {
++ const state = makeRefreshState();
++ const original = state.libraries.u1.items.PARENT1;
++ const store = setupStore(state);
++ await expect(store.dispatch(applyMetadataRefresh('PARENT1', { ...original, title: 'Replacement' },
++  ['title'], 'u1', { ...original, title: 'Earlier title' }))).rejects.toThrow('changed since this preview');
++ await expect(store.dispatch(applyMetadataRefresh('PARENT1', { ...original, itemType: 'journalArticle', publicationTitle: 'Journal' },
++  ['publicationTitle'], 'u1', original))).rejects.toThrow('Select Item Type as well');
++});
++
++test('metadata refresh previews replacements and removals without writing, then applies only selected fields', async () => {
++ const patches = [];
++ server.use(http.patch(`${api}/PARENT1`, async ({ request }) => {
++  patches.push(await request.json());
++  return new HttpResponse(null, { status: 204, headers: { 'Last-Modified-Version': '301' } });
++ }));
++ renderWithProviders(<MetadataRefreshModal />, { preloadedState: makeRefreshState() });
++ const user = userEvent.setup();
++ const dialog = await screen.findByRole('dialog', { name: 'Refresh Metadata' });
++ const titleChoice = await within(dialog).findByRole('checkbox', { name: 'Use new Title' });
++ const publisherChoice = within(dialog).getByRole('checkbox', { name: 'Use new Publisher' });
++ expect(titleChoice).not.toBeChecked();
++ expect(publisherChoice).not.toBeChecked();
++ expect(within(dialog).getByText('Current title')).toBeInTheDocument();
++ expect(within(dialog).getByText('Sample Book')).toBeInTheDocument();
++ expect(within(dialog).getByText('Current publisher')).toBeInTheDocument();
++ expect(within(dialog).getAllByText('Empty').length).toBeGreaterThan(0);
++ expect(patches).toHaveLength(0);
++ await user.click(titleChoice);
++ await user.click(within(dialog).getByRole('button', { name: 'Apply Selected' }));
++ await waitFor(() => expect(patches).toHaveLength(1));
++ expect(patches[0]).toMatchObject({ title: 'Sample Book' });
++ expect(patches[0]).not.toHaveProperty('publisher');
++ expect(patches[0]).not.toHaveProperty('tags');
++ expect(patches[0]).not.toHaveProperty('collections');
++ expect(patches[0]).not.toHaveProperty('relations');
++});
++
++test('Use All New explicitly applies removals as empty values', async () => {
++ const patches = [];
++ server.use(http.patch(`${api}/PARENT1`, async ({ request }) => {
++  patches.push(await request.json());
++  return new HttpResponse(null, { status: 204, headers: { 'Last-Modified-Version': '301' } });
++ }));
++ renderWithProviders(<MetadataRefreshModal />, { preloadedState: makeRefreshState() });
++ const user = userEvent.setup();
++ const dialog = await screen.findByRole('dialog', { name: 'Refresh Metadata' });
++ await within(dialog).findByRole('checkbox', { name: 'Use new Publisher' });
++ await user.click(within(dialog).getByRole('button', { name: 'Use All New' }));
++ await waitFor(() => expect(patches).toHaveLength(1));
++ expect(patches[0]).toMatchObject({ title: 'Sample Book', publisher: '' });
++ expect(patches[0]).not.toHaveProperty('tags');
++ expect(patches[0]).not.toHaveProperty('collections');
++ expect(patches[0]).not.toHaveProperty('relations');
++});
++
++
++test('multiple attachments open Automatic and Manual Entry choices without creating empty records immediately', async () => {
++ const calls = mockWrites();
++ const state = makeState();
++ for (const field of ['items', 'dataObjects']) {
++  state.libraries.u1[field].OTHERPDF = { ...state.libraries.u1[field][key], key: 'OTHERPDF', title: 'Other.pdf', filename: 'Other.pdf', contentType: 'application/pdf' };
++ }
++ state.current.itemKeys = [key, 'OTHERPDF'];
++ state.current.itemKey = null;
++ state.modal = { id: CREATE_PARENT_ITEM };
++ renderWithProviders(<CreateParentItemModal />, { preloadedState: state });
++ await waitForPosition();
++ const dialog = screen.getByRole('dialog', { name: 'Create Parent Item' });
++ expect(within(dialog).getByRole('button', { name: 'Automatic' })).toBeEnabled();
++ expect(within(dialog).getByRole('button', { name: 'Manual Entry' })).toBeEnabled();
++ expect(within(dialog).queryByRole('textbox')).not.toBeInTheDocument();
++ expect(calls.created).toHaveLength(0);
++});

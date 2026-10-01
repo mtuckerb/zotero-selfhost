@@ -1,0 +1,8 @@
+/* Reserve pinch gestures on the reader shell. Each nested document must
+   also declare ownership on its own scrolling surface (as the PDF does). */
+#split-view,
+.split-view,
+#split-view iframe,
+.split-view iframe {
+	touch-action: pan-x pan-y;
+}
