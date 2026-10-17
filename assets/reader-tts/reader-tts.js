@@ -150,14 +150,14 @@
 			if (!/[.!?…:;]$/.test(heading)) heading += '.';
 			return '\n' + heading + '\n';
 		});
-		return cleanCitationsForSpeech(pruneBoilerplateLines(lines))
+		return cleanCitationsForSpeech(pruneBoilerplateLines(lines)
 			// PDF/OCR can separate the final hyphen from its word with spaces.
 			// Require a line break for visible hyphens; keep within-line compounds.
 			// Look ahead at the next letter so successive wraps (re-\na-\nlignment)
 			// can share a one-letter fragment without skipping the second hyphen.
 			.replace(/([\p{L}\p{M}])[^\S\n]*[-\u00AD\u2010][^\S\n]*\n\s*(?=\p{L})/gu, '$1')
 			// Discretionary soft hyphens are formatting even without a line break.
-			.replace(/\u00AD/g, '')
+			.replace(/\u00AD/g, ''))
 			// Collapse runs of blank lines to exactly one paragraph break.
 			.replace(/\n{2,}/g, '\n\n')
 			// A lone newline is a line wrap, not a sentence end.
@@ -167,14 +167,21 @@
 	}
 
 	function cleanCitationsForSpeech(text) {
+		// Match author-year forms with or without commas, including Unicode
+		// surnames, two authors, organizations and lists of references/years.
+		// Calendar dates and bare years are not citation markers.
+		var name = String.raw`(?!(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?|Spring|Summer|Autumn|Fall|Winter)\b)(?:(?:van|von|de|del|da|dos|du|di|la|le)\s*)?[\p{Lu}\p{Lt}][\p{L}\p{M}'\u2019-]+`;
+		var authors = name + String.raw`(?:\s+(?:&|and)\s+` + name + String.raw`|\s+et\s+al\.?)?`;
+		var years = String.raw`(?:18|19|20)\d{2}[a-z]?(?:\s*,\s*(?:18|19|20)\d{2}[a-z]?)*`;
+		var reference = '(?:' + name + String.raw`\s+)*` + authors
+			+ String.raw`(?:\s*,\s*|\s+)` + years
+			+ String.raw`(?:,\s*p{1,2}\.\s*\d+(?:[–-]\d+)?)?`;
 		return String(text || '')
 			// Numeric citations: [4], [12, 13], [2-5].
 			.replace(/\[\s*\d{1,4}(?:\s*(?:,|;|-|–|—)\s*\d{1,4})*\s*\]/g, ' citation ')
-			// Require a recognizable author-year shape, not merely a year:
-			// dates and ordinary explanations in parentheses are spoken.
-			.replace(/\((?:(?!(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\b)[A-Z][A-Za-z'\u2019-]+(?:\s+(?:&|and)\s+[A-Z][A-Za-z'\u2019-]+|\s+et\s+al\.)?,\s*(?:18|19|20)\d{2}[a-z]?(?:,\s*p{1,2}\.\s*\d+(?:[–-]\d+)?)?)(?:;\s*(?!(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\b)[A-Z][A-Za-z'\u2019-]+(?:\s+(?:&|and)\s+[A-Z][A-Za-z'\u2019-]+|\s+et\s+al\.)?,\s*(?:18|19|20)\d{2}[a-z]?)*\)/g, ' citation ')
-			// Common inline forms like "Smith et al. (2020)".
-			.replace(/\b(?!(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\b)[A-Z][A-Za-z'\u2019-]+(?:\s+et\s+al\.)?\s+\((?:18|19|20)\d{2}[a-z]?\)/g, 'citation');
+			.replace(new RegExp(String.raw`\(\s*` + reference + String.raw`(?:\s*;\s*` + reference + String.raw`)*\s*\)`, 'gu'), ' citation ')
+			// Match the full author list, rather than just its final surname.
+			.replace(new RegExp(String.raw`(^|[^\p{L}\p{M}'\u2019-])` + authors + String.raw`\s*\(\s*` + years + String.raw`\s*\)`, 'gu'), '$1citation');
 	}
 
 	function pruneBoilerplateLines(text) {

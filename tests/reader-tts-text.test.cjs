@@ -28,6 +28,43 @@ test('speech citation cleanup preserves ordinary parenthetical dates', () => {
  assert.equal(api.normalizeForSpeech('Evidence (Smith & Jones, 2020) supports this.'),
   'Evidence citation supports this.');
 });
+// Citation forms from Mueller et al., "Stigma in attention deficit
+// hyperactivity disorder" (attachment M7DG7EGN), including PDF line wraps.
+test('replaces the article\'s parenthetical author-year citations', () => {
+ for (const citation of [
+  '(Brohan et al. 2010)', '(Demaio 2006)',
+  '(Zelst 2009; Corrigan and Shapiro 2010)',
+  '(Corrigan\nand Shapiro 2010)',
+  '(Tuchman 1996; Kendall and Hatton 2002; Norvilitis et al. 2002; Koro-Ljungberg and Bussing 2009; dosReis et al. 2010)',
+  '(Ru\u0308sch et al. 2005; Zelst 2009)', '(Rüsch et al. 2005)',
+  '(Harpur et al.\n2008)', '(Koro-\nLjungberg and Bussing 2009)',
+  '(American Psychiatric Association 1994)',
+  '(Dowson et al. 2004; Dige and Wik, 2005; Faraone et al. 2006)',
+  '(Pescosolido et al. 2007, 2008)',
+ ]) {
+  assert.equal(api.normalizeForSpeech('Evidence ' + citation + ' supports this.'),
+   'Evidence citation supports this.', citation);
+ }
+});
+test('replaces complete narrative citations without leaving author fragments', () => {
+ for (const citation of [
+  'Corrigan and Shapiro (2010)', 'Davis-Berman and Pestello (2010)',
+  'Kendall and Shelton\n(2003)', 'Cornett-Ruiz and Hendricks (1993)',
+  'Rüsch et al. (2005)', 'Ru\u0308sch et al. (2005)',
+  'dosReis et al. (2010)', 'Pescosolido et al. (2007, 2008)',
+ ]) {
+  assert.equal(api.normalizeForSpeech('According to ' + citation + ', evidence matters.'),
+   'According to citation, evidence matters.', citation);
+ }
+});
+test('citation replacements preserve parenthetical prose and calendar dates', () => {
+ for (const text of [
+  'The sample (children aged 4 to 10) improved (see Table 2).',
+  'Publication began (2012), with follow-up (2007–2009).',
+  'This happened in May (2020) and (May 2021), then (June, 2022).',
+  'Recruitment (Spring 2020) preceded follow-up (Fall 2021).',
+ ]) assert.equal(api.normalizeForSpeech(text), text);
+});
 const viewport = { width: 600, height: 800, transform: [1, 0, 0, -1, 0, 800] };
 function item(str, { x = 100, y = 200, size = 12, width = 400, hasEOL = true, transform } = {}) {
  return { str, fontName: 'body', width, height: size, hasEOL, transform: transform || [size, 0, 0, size, x, 800 - y] };
