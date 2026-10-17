@@ -39,6 +39,7 @@ test('replaces the article\'s parenthetical author-year citations', () => {
   '(Ru\u0308sch et al. 2005; Zelst 2009)', '(Rüsch et al. 2005)',
   '(Harpur et al.\n2008)', '(Koro-\nLjungberg and Bussing 2009)',
   '(American Psychiatric Association 1994)',
+  '(Janáček 2020)', '(Jana\u0301ček 2020)',
   '(Dowson et al. 2004; Dige and Wik, 2005; Faraone et al. 2006)',
   '(Pescosolido et al. 2007, 2008)',
  ]) {
@@ -52,6 +53,8 @@ test('replaces complete narrative citations without leaving author fragments', (
   'Kendall and Shelton\n(2003)', 'Cornett-Ruiz and Hendricks (1993)',
   'Rüsch et al. (2005)', 'Ru\u0308sch et al. (2005)',
   'dosReis et al. (2010)', 'Pescosolido et al. (2007, 2008)',
+  'Janáček (2020)', 'Jana\u0301ček (2020)',
+  'World Health Organization (2020)', 'World Health Organisation (2020)',
  ]) {
   assert.equal(api.normalizeForSpeech('According to ' + citation + ', evidence matters.'),
    'According to citation, evidence matters.', citation);
@@ -63,6 +66,7 @@ test('citation replacements preserve parenthetical prose and calendar dates', ()
   'Publication began (2012), with follow-up (2007–2009).',
   'This happened in May (2020) and (May 2021), then (June, 2022).',
   'Recruitment (Spring 2020) preceded follow-up (Fall 2021).',
+  'The tournament (World Cup 2022) was televised.',
  ]) assert.equal(api.normalizeForSpeech(text), text);
 });
 const viewport = { width: 600, height: 800, transform: [1, 0, 0, -1, 0, 800] };

@@ -170,10 +170,11 @@
 		// Match author-year forms with or without commas, including Unicode
 		// surnames, two authors, organizations and lists of references/years.
 		// Calendar dates and bare years are not citation markers.
-		var name = String.raw`(?!(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?|Spring|Summer|Autumn|Fall|Winter)\b)(?:(?:van|von|de|del|da|dos|du|di|la|le)\s*)?[\p{Lu}\p{Lt}][\p{L}\p{M}'\u2019-]+`;
-		var authors = name + String.raw`(?:\s+(?:&|and)\s+` + name + String.raw`|\s+et\s+al\.?)?`;
+		var name = String.raw`(?!(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?|Spring|Summer|Autumn|Fall|Winter)(?![\p{L}\p{M}]))(?:(?:van|von|de|del|da|dos|du|di|la|le)\s*)?[\p{Lu}\p{Lt}][\p{L}\p{M}'\u2019-]+`;
+		var organization = '(?:' + name + String.raw`\s+)+(?:Association|Organization|Organisation)`;
+		var authors = '(?:' + organization + '|' + name + String.raw`(?:\s+(?:&|and)\s+` + name + String.raw`|\s+et\s+al\.?)?)`;
 		var years = String.raw`(?:18|19|20)\d{2}[a-z]?(?:\s*,\s*(?:18|19|20)\d{2}[a-z]?)*`;
-		var reference = '(?:' + name + String.raw`\s+)*` + authors
+		var reference = authors
 			+ String.raw`(?:\s*,\s*|\s+)` + years
 			+ String.raw`(?:,\s*p{1,2}\.\s*\d+(?:[–-]\d+)?)?`;
 		return String(text || '')
