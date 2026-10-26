@@ -511,9 +511,11 @@ full-text index is required for PDFs; image-only PDFs need a text layer.
 EPUBs and snapshots still fetch `GET /users/<id>/items/<key>/fulltext`,
 populated by the desktop client's full-text indexing and sync. Their
 indexed text lacks the layout needed for reliable footnote filtering.
+PDF headings are preserved as separate speech parts; multiline titles stay together.
+Playback waits 2 seconds before each heading and 1 second after it, independent
+of playback speed.
 Markdown ATX headings (`# Heading` through `###### Heading`) are read without
-the hash markers and receive a sentence-and-paragraph boundary so the voice
-pauses before continuing into the section body.
+the hash markers and receive the same pause before the section body.
 
 **Read selection** skips semantic headers, footers, and notes, and applies
 the same column order and page-layout filter to visible PDF text. The PDF

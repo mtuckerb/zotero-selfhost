@@ -1,3 +1,30 @@
+diff --git a/eslint.config.mjs b/eslint.config.mjs
+index 35813dd4..2b378926 100644
+--- a/eslint.config.mjs
++++ b/eslint.config.mjs
+@@ -50,10 +50,11 @@ export default [
+ 	// Jest settings for tests
+ 	{
+ 		files: ["test/**/*.{js,jsx}"],
+-		languageOptions,
+-		globals: {
+-			...globals.jest,
++		languageOptions: {
++			...languageOptions,
++			globals: { ...languageOptions.globals, ...globals.jest },
+ 		},
++		settings: { react: { version: "detect" } },
+ 		plugins: {
+ 			react: reactPlugin,
+ 			"jest-dom": jestDom,
+@@ -61,6 +62,7 @@ export default [
+ 		},
+ 		rules: {
+ 			...(reactPlugin.configs?.recommended?.rules ?? {}),
++			...(reactPlugin.configs?.["jsx-runtime"]?.rules ?? {}),
+ 			...(jestDom.configs?.recommended?.rules ?? {}),
+ 		},
+ 	},
 diff --git a/package-lock.json b/package-lock.json
 index a0ef07f7..dea4ce62 100644
 --- a/package-lock.json
@@ -870,10 +897,10 @@ index cf433093..a61fd17c 100644
  							tabIndex={-2}
 diff --git a/src/js/component/modal/metadata-refresh.jsx b/src/js/component/modal/metadata-refresh.jsx
 new file mode 100644
-index 00000000..3b2f70aa
+index 00000000..47dfb617
 --- /dev/null
 +++ b/src/js/component/modal/metadata-refresh.jsx
-@@ -0,0 +1,143 @@
+@@ -0,0 +1,168 @@
 +import cx from 'classnames';
 +import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 +import { Button, Icon, Spinner } from 'web-common/components';
@@ -894,12 +921,26 @@ index 00000000..3b2f70aa
 +	const isTouchOrSmall = useSelector(state => state.device.isTouchOrSmall);
 +	const itemFields = useSelector(state => state.meta.itemFields);
 +	const itemTypes = useSelector(state => state.meta.itemTypes);
++	const itemTypeFields = useSelector(state => state.meta.itemTypeFields);
 +	const closeButtonRef = useRef(null);
++	const errorRef = useRef(null);
 +	const [preview, setPreview] = useState(null);
 +	const [selectedFields, setSelectedFields] = useState(new Set());
 +	const [isLoading, setIsLoading] = useState(false);
 +	const [isApplying, setIsApplying] = useState(false);
 +	const [error, setError] = useState(null);
++
++	const requiresTypeChange = useCallback((change, currentType) => {
++		const value = change.newValue;
++		return !['itemType', 'creators'].includes(change.field)
++			&& ![undefined, null, ''].includes(value) && !(Array.isArray(value) && value.length === 0)
++			&& itemTypeFields[currentType]
++			&& !itemTypeFields[currentType].some(({ field }) => field === change.field);
++	}, [itemTypeFields]);
++
++	useEffect(() => {
++		if (error) errorRef.current?.focus();
++	}, [error]);
 +
 +	useEffect(() => {
 +		if (!isOpen) return undefined;
@@ -911,14 +952,16 @@ index 00000000..3b2f70aa
 +		dispatch(previewMetadataRefresh(parentItemKey, libraryKey)).then(result => {
 +			if (!active) return;
 +			setPreview(result);
-+			setSelectedFields(new Set(result.changes.filter(change => change.useNewByDefault).map(change => change.field)));
++			setSelectedFields(new Set(result.changes
++				.filter(change => change.useNewByDefault && !requiresTypeChange(change, result.parentItem.itemType))
++				.map(change => change.field)));
 +		}).catch(reason => {
 +			if (active) setError(reason?.message || 'Metadata could not be refreshed.');
 +		}).finally(() => {
 +			if (active) setIsLoading(false);
 +		});
 +		return () => { active = false; };
-+	}, [dispatch, isOpen, libraryKey, parentItemKey]);
++	}, [dispatch, isOpen, libraryKey, parentItemKey, requiresTypeChange]);
 +
 +	const fieldLabels = useMemo(() => Object.fromEntries(itemFields.map(({ field, localized }) => [field, localized])), [itemFields]);
 +	const itemTypeLabels = useMemo(() => Object.fromEntries(itemTypes.map(({ itemType, localized }) => [itemType, localized])), [itemTypes]);
@@ -944,11 +987,16 @@ index 00000000..3b2f70aa
 +	const toggleField = useCallback(field => {
 +		setSelectedFields(current => {
 +			const next = new Set(current);
-+			if (next.has(field)) next.delete(field);
-+			else next.add(field);
++			if (next.has(field)) {
++				next.delete(field);
++				if (field === 'itemType') {
++					preview.changes.filter(change => requiresTypeChange(change, preview.parentItem.itemType))
++						.forEach(change => next.delete(change.field));
++				}
++			} else next.add(field);
 +			return next;
 +		});
-+	}, []);
++	}, [preview, requiresTypeChange]);
 +	const applyFields = useCallback(async fields => {
 +		if (!preview || fields.length === 0) return;
 +		setError(null);
@@ -984,17 +1032,21 @@ index 00000000..3b2f70aa
 +				</div>
 +				<div className="modal-body">
 +					{isLoading && <div className="metadata-refresh-status" role="status"><Spinner /> Looking up metadata...</div>}
-+					{error && <div className="alert alert-danger" role="alert">{error}</div>}
++					{error && <div className="alert alert-danger" role="alert" tabIndex={-1} ref={errorRef}>{error}</div>}
 +					{preview?.warning && <div className="alert alert-warning">{preview.warning}</div>}
 +					{preview && preview.changes.length === 0 && <div role="status">Metadata is already up to date.</div>}
 +					{preview?.changes.length > 0 && (
 +						<div className="metadata-refresh-table-wrap">
++							{preview.changes.some(change => requiresTypeChange(change, preview.parentItem.itemType)) && (
++								<p id="metadata-refresh-type-help">Select Item Type to use fields that are only available for the new item type.</p>
++							)}
 +							<table className="metadata-refresh-table">
 +								<thead><tr><th scope="col">Use New</th><th scope="col">Field</th><th scope="col">Current</th><th scope="col">New</th></tr></thead>
 +								<tbody>{preview.changes.map(change => {
 +									const label = getFieldLabel(change.field);
++									const needsType = requiresTypeChange(change, preview.parentItem.itemType);
 +									return <tr key={change.field}>
-+										<td><input type="checkbox" aria-label={`Use new ${label}`} checked={selectedFields.has(change.field)} disabled={isApplying} onChange={() => toggleField(change.field)} /></td>
++										<td><input type="checkbox" aria-label={`Use new ${label}`} checked={selectedFields.has(change.field)} disabled={isApplying || (needsType && !selectedFields.has('itemType'))} aria-describedby={needsType ? 'metadata-refresh-type-help' : undefined} onChange={() => toggleField(change.field)} /></td>
 +										<th scope="row">{label}</th>
 +										<td>{formatValue(change.field, change.currentValue)}</td>
 +										<td>{formatValue(change.field, change.newValue)}</td>
@@ -1460,10 +1512,10 @@ index 00000000..ad47110b
 +});
 diff --git a/test/metadata-workflows.test.jsx b/test/metadata-workflows.test.jsx
 new file mode 100644
-index 00000000..8ad11acc
+index 00000000..e749ebe6
 --- /dev/null
 +++ b/test/metadata-workflows.test.jsx
-@@ -0,0 +1,345 @@
+@@ -0,0 +1,411 @@
 +/* @jest-environment ./test/utils/zotero-env.js */
 +import '@testing-library/jest-dom';
 +import { http, HttpResponse } from 'msw';
@@ -1771,6 +1823,72 @@ index 00000000..8ad11acc
 + expect(patches[0]).not.toHaveProperty('tags');
 + expect(patches[0]).not.toHaveProperty('collections');
 + expect(patches[0]).not.toHaveProperty('relations');
++});
++
++test.each([false, true])('Apply Selected saves only valid fields (change Item Type: %s)', async changeType => {
++ const state = makeRefreshState();
++ for (const field of ['items', 'dataObjects']) state.libraries.u1[field].PARENT1.itemType = 'document';
++ const book = zipSync({
++  'META-INF/container.xml': strToU8('<container><rootfiles><rootfile full-path="book.opf"/></rootfiles></container>'),
++  'book.opf': strToU8('<metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Sample Book</dc:title><dc:creator>Ada Lovelace</dc:creator><dc:language>en</dc:language><dc:identifier>ISBN 9780801333101</dc:identifier></metadata>'),
++ });
++ const patches = [];
++ server.use(
++  http.get('https://files.zotero.net/sample.epub', () => HttpResponse.arrayBuffer(book.buffer)),
++  http.post('https://localhost/translate/search', () => HttpResponse.json([])),
++  http.patch(`${api}/PARENT1`, async ({ request }) => {
++   patches.push(await request.json());
++   return new HttpResponse(null, { status: 204, headers: { 'Last-Modified-Version': '301' } });
++  }),
++ );
++ renderWithProviders(<MetadataRefreshModal />, { preloadedState: state });
++ const user = userEvent.setup();
++ const dialog = await screen.findByRole('dialog', { name: 'Refresh Metadata' });
++ const isbnChoice = await within(dialog).findByRole('checkbox', { name: 'Use new ISBN' });
++ expect(isbnChoice).not.toBeChecked();
++ expect(isbnChoice).toBeDisabled();
++ expect(within(dialog).getByText(/Select Item Type to use fields/)).toBeInTheDocument();
++ const typeChoice = within(dialog).getByRole('checkbox', { name: 'Use new Item Type' });
++ await user.click(typeChoice);
++ expect(isbnChoice).toBeEnabled();
++ await user.click(isbnChoice);
++ expect(isbnChoice).toBeChecked();
++ await user.click(typeChoice);
++ expect(isbnChoice).not.toBeChecked();
++ expect(isbnChoice).toBeDisabled();
++ await user.click(within(dialog).getByRole('checkbox', { name: 'Use new Title' }));
++ if (changeType) {
++  await user.click(typeChoice);
++  await user.click(isbnChoice);
++ }
++ await user.click(within(dialog).getByRole('button', { name: 'Apply Selected' }));
++ await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Refresh Metadata' })).not.toBeInTheDocument());
++ expect(patches).toHaveLength(1);
++ expect(patches[0]).toMatchObject({ title: 'Sample Book', language: 'en' });
++ if (changeType) expect(patches[0]).toMatchObject({ itemType: 'book', ISBN: '9780801333101' });
++ else {
++  expect(patches[0]).not.toHaveProperty('ISBN');
++  expect(patches[0]).not.toHaveProperty('itemType');
++ }
++ expect(patches[0]).not.toHaveProperty('publisher');
++});
++
++test('a rejected selection focuses its error and keeps the dialog usable', async () => {
++ const state = makeRefreshState();
++ const { store } = renderWithProviders(<MetadataRefreshModal />, { preloadedState: state });
++ const user = userEvent.setup();
++ const dialog = await screen.findByRole('dialog', { name: 'Refresh Metadata' });
++ const titleChoice = await within(dialog).findByRole('checkbox', { name: 'Use new Title' });
++ await user.click(titleChoice);
++ // Simulate a concurrent update after the preview was loaded.
++ await store.dispatch({ type: 'RECEIVE_UPDATE_ITEM', libraryKey: 'u1', itemKey: 'PARENT1',
++  item: { ...state.libraries.u1.items.PARENT1, title: 'Changed elsewhere' }, patch: { title: 'Changed elsewhere' } });
++ await user.click(within(dialog).getByRole('button', { name: 'Apply Selected' }));
++ const error = await within(dialog).findByRole('alert');
++ expect(error).toHaveTextContent('changed since this preview');
++ expect(error).toHaveFocus();
++ expect(within(dialog).getByRole('button', { name: 'Apply Selected' })).toBeEnabled();
++ expect(within(dialog).getByRole('button', { name: 'Cancel' })).toBeEnabled();
 +});
 +
 +test('Use All New explicitly applies removals as empty values', async () => {

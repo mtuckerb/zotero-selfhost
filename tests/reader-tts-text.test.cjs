@@ -259,6 +259,34 @@ test('reads complete columns despite interleaved PDF drawing order', () => {
  assert.equal(text, [1,2,3,4,5].map(n=>'Left row '+n+' ends here.').concat([1,2,3,4,5].map(n=>'Right row '+n+' ends here.')).join('\n'));
 });
 
+test('separates an offset abstract sidebar from equal-width article columns below it', () => {
+ const items = [item('Article title', { x: 38, y: 180, width: 420, size: 16 })];
+ for (let n = 0; n < 16; n++) {
+  items.push(item('Abstract row ' + n, { x: 38, y: 354 + n * 10.5, width: 377, size: 8.7 }));
+  items.push(item('Sidebar row ' + n, { x: 432, y: 359 + n * 10.5, width: 100, size: 8.7 }));
+ }
+ for (let n = 0; n < 10; n++) {
+  items.push(item('Left row ' + n, { x: 38, y: 565 + n * 10.5, width: 241, size: 8.7 }));
+  items.push(item('Right row ' + n, { x: 297, y: 565 + n * 10.5, width: 241, size: 8.7 }));
+ }
+ const lines = layout(items, null, { ...viewport, width: 576 }).lines.map(line => line.text);
+ assert.deepEqual(Array.from(lines), ['Article title',
+  ...Array.from({ length: 16 }, (_, n) => 'Abstract row ' + n),
+  ...Array.from({ length: 16 }, (_, n) => 'Sidebar row ' + n),
+  ...Array.from({ length: 10 }, (_, n) => 'Left row ' + n),
+  ...Array.from({ length: 10 }, (_, n) => 'Right row ' + n)]);
+});
+
+test('keeps each column together across blank space when its width does not change', () => {
+ const items = [];
+ for (const y of [200, 218, 236, 320, 338, 356]) {
+  items.push(item('Left ' + y, { x: 60, y, width: 200 }));
+  items.push(item('Right ' + y, { x: 320, y, width: 210 }));
+ }
+ assert.equal(speak(items), [200, 218, 236, 320, 338, 356].map(y => 'Left ' + y)
+  .concat([200, 218, 236, 320, 338, 356].map(y => 'Right ' + y)).join('\n'));
+});
+
 test('keeps a tall chapter-outline sidebar out of the adjacent article flow', () => {
  const items = [
   item('Direct Practice Pitfalls', { x: 75, y: 90, width: 280, size: 20 }),
@@ -277,7 +305,7 @@ test('keeps a tall chapter-outline sidebar out of the adjacent article flow', ()
   item('The negative consequences may provide examples of these pitfalls.', { x: 75, y: 434, width: 280 })
  ];
  const text = speak(items);
- const spokenLines = text.split('\n');
+ const spokenLines = text.replace(/^# /gm, '').split('\n');
  const articleLines = items.filter(entry => entry.transform[4] < 395).map(entry => spokenLines.indexOf(entry.str));
  const outlineLines = items.filter(entry => entry.transform[4] >= 395).map(entry => spokenLines.indexOf(entry.str));
  assert.ok(Math.max(...articleLines) < Math.min(...outlineLines), 'article and chapter outline were interleaved:\n' + text);
@@ -494,4 +522,52 @@ test('retains every OCR body fragment on the six reported article pages, in colu
   const rightWords=columnItems.filter(i=>i.transform[4]>=260).map(i=>text.indexOf(i.str));
   assert.ok(Math.max(...leftWords)<Math.min(...rightWords),'column jump on article page '+(index+1));
  }
+});
+
+
+test('PDF extraction preserves heading boundaries and joins multiline titles', () => {
+ const text = speak([
+  item('A section heading', { y: 200, size: 14, width: 200 }),
+  item('continued on a second line', { y: 219, size: 14, width: 220 }),
+  item('The body paragraph starts after the complete title.', { y: 260, size: 12 }),
+  item('A second body line continues the paragraph.', { y: 278, size: 12 }),
+  item('Questions', { y: 310, size: 11, width: 70 }),
+  item('1. What happens next in this family?', { y: 330, size: 11 })
+ ]);
+ assert.match(text, /^# A section heading continued on a second line\n/);
+ assert.match(text, /\n# Questions\n1\./);
+ assert.doesNotMatch(text, /# The body|# A second body|# 1\./);
+});
+
+
+test('a large drop cap does not turn the opening paragraph into a heading', () => {
+ const text = speak([
+  item('T', { x: 60, y: 250, size: 24, width: 16 }),
+  item('he opening paragraph continues with ordinary body text', { x: 80, y: 250, size: 10 }),
+  item('and finishes on the following printed line.', { x: 60, y: 268, size: 10 }),
+  item('The next full body line keeps the same font size.', { x: 60, y: 286, size: 10 })
+ ]);
+ assert.doesNotMatch(text, /^# /m);
+});
+
+
+test('repairs OCR omission of line-end hyphens in classification and orientation', () => {
+ const items = [
+  item('The classifica', { x: 100, y: 200, width: 260, size: 10 }),
+  item('tion describes the kind of orienta', { x: 100, y: 220, width: 260, size: 10 }),
+  item('tion a social worker should have.', { x: 100, y: 240, width: 260, size: 10 })
+ ];
+ const { doc, selection } = pdfSurface(items);
+ const expected = 'The classification describes the kind of orientation a social worker should have.';
+ assert.equal(api.normalizeForSpeech(speak(items)), expected);
+ assert.equal(api.normalizeForSpeech(api.selectionSpeechText(doc, selection)), expected);
+ const tokens = api.surfaceTokensForDoc(doc);
+ for (const word of ['classification', 'orientation']) {
+  const token = tokens.find(token => token.norm === word);
+  assert.ok(token, 'highlight matches ' + word);
+  assert.equal(token.segments.length, 2);
+ }
+ assert.equal(api.normalizeForSpeech('Other classifica\n\ntions remain.\nWell-being and client-centered care.'),
+  'Other classifications remain. Well-being and client-centered care.');
+ assert.equal(api.normalizeForSpeech('A new orienta\ntional approach follows.'), 'A new orienta tional approach follows.');
 });

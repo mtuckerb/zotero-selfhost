@@ -18,6 +18,12 @@ field can be selected independently, or **Use All New** can accept the complete
 fresh result. Tags, collections, relations, notes, and attachments are never
 offered for replacement and remain intact.
 
+Fields that require the proposed Item Type remain unchecked and disabled until
+**Item Type** is selected. Deselecting it also clears those dependent selections,
+so **Apply Selected** can save compatible fields without a type change. Save
+errors receive focus and scroll into view instead of leaving an unexplained
+open dialog.
+
 PDFs retain Zotero's recognizer. Before sending a PDF to it, explicit
 identifiers in the attachment URL, title, or filename are resolved first. This
 keeps a filename ISBN from losing to an incidental DOI found inside a full
@@ -62,6 +68,13 @@ authors and no identifier, and the old client stored exactly that sparse
 result. The same batch showed a full-book filename ISBN being ignored in favor
 of a chapter DOI. Regression tests now cover both cases.
 
+Validation on 2026-10-08 covers selective refresh with and without an Item Type
+change, clearing dependent selections, and focusing save errors. All 41 focused
+tests and the Nix JavaScript/Sass production build pass. The new output hash is
+`sha256-5+voF0aRscCmOZKs1nsq2O7DwhtDRVlr1Ozl1pCVcR8=`; deployed on 2026-10-08.
+The patch also corrects the upstream ESLint globals and JSX runtime
+settings; lint passes for the refresh dialog and workflow tests.
+
 Validation on 2026-10-01 covers preferred-attachment loading, stale refresh
 previews, and fields that require an item-type change. The four focused Jest
 suites pass all 38 tests inside the fixed-output production build, followed by
@@ -85,6 +98,15 @@ writes, retained `.epub`, and produced no browser errors. The production
 library was not modified by these tests.
 
 ## Deployment
+
+Deployed the selective-refresh fix on 2026-10-08. The only changed web asset is
+`static/web-library/zotero-web-library.js`; the live response matches the tested
+bundle. nginx and zotero-rs are healthy, and live WebKit navigation checks at
+320px and 390px passed without page errors or library writes.
+Built SPA: `/nix/store/grwvnn9vwg2xfqgrq1qk4zcc87iydj52-zotero-web-library-configured`.
+System: `/nix/store/dxakfvk6b90kab9vwxrxm48734g4a9y7-nixos-system-FederalNix-26.05.20260427.1c3fe55`.
+Only the `zotero-selfhost` source pin was updated in the workspace and deployed
+NixOS lock files; unrelated workspace changes were preserved.
 
 Deployed on 2026-09-25 with the web-library output hash
 `sha256-viOlKMCyjaW59lvzpK6LEtIGCXK20/Vm5JdP6G53IBU=`.

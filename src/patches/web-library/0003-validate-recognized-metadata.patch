@@ -1,0 +1,168 @@
+--- a/test/attachment-metadata.test.js
++++ b/test/attachment-metadata.test.js
+@@ -4,7 +4,7 @@
+ import {
+  attachmentFormat, buildMetadataRefreshChanges, buildMetadataRefreshPatch,
+  canRetrieveAttachmentMetadata, extractEmbeddedMetadata, findMetadataAttachment, getMetadataAttachmentKey,
+- retrieveNonPDFMetadata
++ retrieveNonPDFMetadata, supplementWeakPDFMetadata
+ } from '../src/js/common/attachment-metadata';
+ import { getItemFromIdentifier } from '../src/js/common/identifiers';
+ 
+@@ -21,6 +21,31 @@
+  getItemFromIdentifier.mockReset();
+ });
+ 
++test('rejects a citation lookup whose title does not identify the document', async () => {
++ getItemFromIdentifier.mockResolvedValue({ itemType: 'journalArticle', title: 'An unrelated referenced paper', DOI: '10.1234/reference' });
++ const result = await retrieveNonPDFMetadata(attachment, { readFile: async () => epub(), translateUrl: '/translate' });
++ expect(result.metadata.title).toBe('The Diving Bell and the Butterfly');
++ expect(result.metadata.itemType).toBe('book');
++ expect(result.warning).toContain('review');
++});
++
++test('a URL or year alone does not make PDF recognition authoritative', () => {
++ const result = supplementWeakPDFMetadata({ title: 'TIP 57.pdf', filename: 'TIP 57.pdf' },
++  { Title: 'Trauma-Informed Care in Behavioral Health Services', Author: 'SAMHSA' },
++  { itemType: 'journalArticle', title: 'TIP 57', url: 'https://example.com', date: '2014' });
++ expect(result.metadata.itemType).toBe('document');
++ expect(result.warning).toContain('review');
++});
++
++test('rejects strong PDF metadata belonging to a cited work', () => {
++ const result = supplementWeakPDFMetadata({ title: 'A book.pdf', filename: 'A book.pdf' },
++  { Title: 'A complete book about social work', Author: 'An Author' },
++  { itemType: 'journalArticle', title: 'Unrelated paper', DOI: '10.1234/reference', creators: [{ name: 'Someone Else', creatorType: 'author' }] });
++ expect(result.metadata.title).toBe('A complete book about social work');
++ expect(result.metadata.DOI).toBeUndefined();
++ expect(result.warning).toContain('review');
++});
++
+ test('reads EPUB metadata and ISBN from the declared package', () => {
+  const result = extractEmbeddedMetadata(epub(), 'epub');
+  expect(result.metadata).toMatchObject({ itemType: 'book', title: 'The Diving Bell and the Butterfly', publisher: 'Knopf Doubleday Publishing Group', date: '2008-03-06', language: 'en', creators: [{ firstName: 'Jean-Dominique', lastName: 'Bauby', creatorType: 'author' }] });
+@@ -28,10 +53,10 @@
+ });
+ 
+ test('uses an ISBN lookup and excludes suggested additional attachments', async () => {
+- getItemFromIdentifier.mockResolvedValue({ itemType: 'book', title: 'Catalog title', attachments: [{}], notes: [{}] });
++ getItemFromIdentifier.mockResolvedValue({ itemType: 'book', title: 'The Diving Bell and the Butterfly', attachments: [{}], notes: [{}] });
+  const result = await retrieveNonPDFMetadata(attachment, { readFile: async () => epub(), translateUrl: '/translate' });
+  expect(getItemFromIdentifier).toHaveBeenCalledWith('ISBN: 9780307454836', '/translate');
+- expect(result).toEqual({ metadata: { itemType: 'book', title: 'Catalog title' }, warning: null });
++ expect(result).toEqual({ metadata: { itemType: 'book', title: 'The Diving Bell and the Butterfly' }, warning: null });
+ });
+ 
+ test('retains embedded book fields when lookup fails or returns no result', async () => {
+--- a/test/metadata-workflows.test.jsx
++++ b/test/metadata-workflows.test.jsx
+@@ -128,6 +128,17 @@
+  expect(store.getState().recognize.entries[0].warning).toContain('file details');
+ });
+ 
++test.each([['book', 'book'], ['report', 'report'], [undefined, 'document']])('PDF fallback preserves type %s and corporate authors', async (type, itemType) => {
++ const calls = mockWrites();
++ const title = 'A source with a corporate author';
++ const pdfState = makeState({ title: 'source.pdf', filename: 'source.pdf', contentType: 'application/pdf' });
++ PDFWorker.mockImplementation(() => ({ getRecognizerData: () => ({ metadata: { Title: title }, totalPages: 1, pages: [[612, 792, ['text']]] }) }));
++ server.use(http.post('https://localhost/recognize/recognize', () => HttpResponse.json({ type, title, authors: [{ name: 'An Association' }], publisher: 'A Press' })));
++ const store = setupStore(pdfState);
++ await store.dispatch(retrieveMetadata(key, 'u1', 'test-task'));
++ expect(calls.created[0]).toMatchObject({ itemType, title, creators: [{ creatorType: 'author', name: 'An Association' }] });
++});
++
+ test('PDF filename ISBN takes priority over an incidental DOI from the recognizer', async () => {
+  const calls = mockWrites();
+  const identifiers = [];
+--- a/src/js/common/attachment-metadata.js
++++ b/src/js/common/attachment-metadata.js
+@@ -183,10 +183,12 @@
+ export const supplementWeakPDFMetadata = (attachment, pdfMetadata = {}, recognizedItem) => {
+ 	const hasBibliographicMetadata = recognizedItem && (
+ 		recognizedItem.creators?.length
+-		|| ['DOI', 'ISBN', 'ISSN', 'publicationTitle', 'bookTitle', 'publisher', 'date', 'url']
++		|| ['DOI', 'ISBN', 'ISSN', 'publicationTitle', 'bookTitle', 'publisher']
+ 			.some(field => recognizedItem[field])
+ 	);
+-	if (hasBibliographicMetadata) return { metadata: recognizedItem, warning: null };
++	const titleConflict = pdfMetadata.Title?.trim() && recognizedItem?.title
++		&& titleMatchScore(pdfMetadata.Title, recognizedItem.title) < 0.8;
++	if (hasBibliographicMetadata && !titleConflict) return { metadata: recognizedItem, warning: null };
+ 	const author = (pdfMetadata.Author || '').trim();
+ 	const creators = !author || /^(?:none|unknown|anonymous)$/i.test(author) ? [] : author
+ 		.split(/\s*;\s*/).filter(Boolean).map(name => {
+@@ -201,7 +203,7 @@
+ 		language: pdfMetadata.Language?.trim(),
+ 		publisher: pdfMetadata.EBX_PUBLISHER?.trim(),
+ 	}).filter(([, value]) => value !== undefined && value !== ''));
+-	const remote = Object.fromEntries(Object.entries(omit(recognizedItem || {}, ['itemType', 'creators']))
++	const remote = Object.fromEntries(Object.entries(omit(titleConflict ? {} : recognizedItem || {}, ['itemType', 'creators']))
+ 		.filter(([, value]) => value !== undefined && value !== ''));
+ 	const metadata = { ...basicAttachmentMetadata(attachment), ...embedded, ...remote, itemType: 'document', creators };
+ 	return { metadata, warning: 'From embedded PDF metadata; review details' };
+@@ -242,7 +244,9 @@
+ 				// Translation results may carry attachment suggestions; the original file is retained.
+ 				const metadata = omit(item, ['key', 'version', 'attachments', 'notes']);
+ 				const score = titleMatchScore(referenceTitle, metadata.title);
+-				if (!bestMatch || score > bestMatch.score) bestMatch = { metadata, score };
++				const filenameISBN = !embedded.metadata.title && kind === 'ISBN'
++					&& (attachment.filename || '').replace(/\.[^.]+$/, '').replace(/[- ]/g, '') === value.replace(/[- ]/g, '');
++				if (!bestMatch || score > bestMatch.score) bestMatch = { metadata, score, filenameISBN };
+ 				// An exact title match cannot be improved by later identifiers.
+ 				if (score === 1) break;
+ 			}
+@@ -250,7 +254,7 @@
+ 			// Embedded fields remain useful when the lookup service is unavailable.
+ 		}
+ 	}
+-	if (bestMatch) return { metadata: bestMatch.metadata, warning: null };
++	if (bestMatch && (bestMatch.score >= 0.8 || bestMatch.filenameISBN)) return { metadata: bestMatch.metadata, warning: null };
+ 	const basic = basicAttachmentMetadata(attachment);
+ 	const fields = Object.fromEntries(Object.entries(embedded.metadata).filter(([, value]) => value !== undefined && value !== ''));
+ 	const metadata = { ...basic, ...fields, title: fields.title || basic.title };
+--- a/src/js/actions/recognize.js
++++ b/src/js/actions/recognize.js
+@@ -114,7 +114,9 @@
+ 	let recognizedItem, warning;
+ 	if (format === 'pdf' && ['imported_file', 'imported_url'].includes(attachmentItem.linkMode)) {
+ 		const recognizerInputData = await dispatch(getRecognizerData(itemKey, libraryKey));
+-		const attachmentResult = await retrieveNonPDFMetadata(attachmentItem, { translateUrl: state.config.translateUrl });
++		const attachmentResult = await retrieveNonPDFMetadata({
++			...attachmentItem, title: recognizerInputData.metadata?.Title || attachmentItem.title
++		}, { translateUrl: state.config.translateUrl });
+ 		if (!attachmentResult.warning) {
+ 			({ metadata: recognizedItem, warning } = attachmentResult);
+ 			updateStage?.(1);
+@@ -252,24 +254,23 @@
+ 
+ 		// no identifier found, or translation failed
+ 		if (recognizerData.title) {
+-			let itemType = 'journalArticle';
+-
+-			if (recognizerData.type === 'book-chapter') {
+-				itemType = 'bookSection';
+-			}
++			const itemType = { 'journal-article': 'journalArticle', 'book-chapter': 'bookSection', book: 'book', report: 'report' }[recognizerData.type] || 'document';
+ 
+ 			const newItem = {
+ 				itemType,
+-				creators: (recognizerData.authors || []).map(author => ({
+-					creatorType: 'author', ...pick(author, ['firstName', 'lastName'])
++				creators: (recognizerData.authors || []).filter(author => author.name || author.lastName).map(author => ({
++					creatorType: 'author', ...(author.name ? { name: author.name } : pick(author, ['firstName', 'lastName']))
+ 				})),
+ 				title: recognizerData.title,
+ 				abstractNote: recognizerData.abstract,
+ 				date: recognizerData.year,
+ 				libraryCatalog: 'Zotero',
+-				...pick(recognizerData, ['pages', 'volume', 'url', 'language']),
+-				...(itemType === 'journalArticle' ? { issue: recognizerData.issue, issn: recognizerData.ISSN, publicationTitle: recognizerData.container } : {}),
++				...pick(recognizerData, ['url', 'language']),
++				...(['journalArticle', 'bookSection'].includes(itemType) ? pick(recognizerData, ['pages', 'volume']) : {}),
++				...(itemType === 'journalArticle' ? { issue: recognizerData.issue, ISSN: recognizerData.ISSN, publicationTitle: recognizerData.container } : {}),
+ 				...(itemType === 'bookSection' ? { bookTitle: recognizerData.container, publisher: recognizerData.publisher } : {}),
++				...(itemType === 'book' ? { publisher: recognizerData.publisher } : {}),
++				...(itemType === 'report' ? { institution: recognizerData.publisher } : {}),
+ 			};
+ 
+ 			return newItem;

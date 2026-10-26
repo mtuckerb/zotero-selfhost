@@ -75,14 +75,58 @@
 	var DEFAULT_HIGHLIGHT_STYLE = HIGHLIGHT_STYLES.indexOf(CFG.highlightStyle) !== -1
 		? CFG.highlightStyle
 		: 'ball';
-	var pronunciations = Object.create(null);
-	var pronunciationConfig = CFG.pronunciations || { meso: 'mˈɛzO' };
-	Object.keys(pronunciationConfig).forEach(function (word) {
-		var phonemes = pronunciationConfig[word];
-		if (typeof phonemes === 'string' && phonemes.trim() && !/[\/()[\]\r\n]/u.test(phonemes)) {
-			pronunciations[word.toLowerCase()] = phonemes.trim();
+	var PRONUNCIATIONS_ENDPOINT = CFG.pronunciationsEndpoint || null;
+	var pronunciationRefresh = null;
+
+	function normalizePronunciationDictionary(raw) {
+		if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+		var words = Object.keys(raw);
+		if (words.length > 500) return null;
+		var normalized = Object.create(null);
+		for (var i = 0; i < words.length; i++) {
+			var word = words[i].trim().toLowerCase();
+			var phonemes = raw[words[i]];
+			if (!word || !/^[\p{L}\p{M}\p{N}_]+$/u.test(word)
+				|| Object.prototype.hasOwnProperty.call(normalized, word)
+				|| typeof phonemes !== 'string') return null;
+			phonemes = phonemes.trim();
+			if (!phonemes || phonemes.length > 64 || /[\/()[\]\r\n]/u.test(phonemes)) return null;
+			normalized[word] = phonemes;
 		}
-	});
+		return normalized;
+	}
+
+	var pronunciationConfig = Object.prototype.hasOwnProperty.call(CFG, 'pronunciations')
+		? CFG.pronunciations
+		: { meso: 'mˈɛzO' };
+	var pronunciations = normalizePronunciationDictionary(pronunciationConfig)
+		|| Object.create(null);
+
+	/** Fetch before synthesis so Settings changes apply to the next clip. A bad
+	 * response leaves the last valid dictionary in place. Concurrent prefetches
+	 * share one request. */
+	function refreshPronunciations() {
+		if (!PRONUNCIATIONS_ENDPOINT) return Promise.resolve();
+		if (pronunciationRefresh) return pronunciationRefresh;
+		pronunciationRefresh = fetch(PRONUNCIATIONS_ENDPOINT, {
+			credentials: 'same-origin',
+			cache: 'no-store'
+		}).then(function (response) {
+			if (!response.ok) throw new Error('Pronunciation registry HTTP ' + response.status);
+			return response.json();
+		}).then(function (payload) {
+			var next = payload && payload.ok === true
+				? normalizePronunciationDictionary(payload.pronunciations)
+				: null;
+			if (!next) throw new Error('Invalid pronunciation registry');
+			pronunciations = next;
+		}).catch(function () {
+			// Offline registry: keep the last valid dictionary and continue reading.
+		}).then(function () {
+			pronunciationRefresh = null;
+		});
+		return pronunciationRefresh;
+	}
 
 	/**
 	 * Characters per synthesized part.
@@ -131,6 +175,19 @@
 		return chunks;
 	}
 
+	function speechParts(text) {
+		var parts = [];
+		String(text || '').replace(/\r\n?/g, '\n')
+			.split(/(^[ \t]{0,3}#{1,6}[ \t]+.+$)/gm).forEach(function (section) {
+				var heading = /^[ \t]{0,3}#{1,6}[ \t]+/.test(section);
+				var chunks = splitTextForSpeech(normalizeForSpeech(section), CHUNK_MAX_CHARS);
+				chunks.forEach(function (chunk, index) {
+					parts.push(createPart(chunk, 0, heading && index === chunks.length - 1 ? 1000 : 0, heading && index === 0 ? 2000 : 0));
+				});
+			});
+		return parts;
+	}
+
 	/**
 	 * Clean up text pulled out of a PDF text layer or the full-text index.
 	 *
@@ -157,7 +214,10 @@
 			// can share a one-letter fragment without skipping the second hyphen.
 			.replace(/([\p{L}\p{M}])[^\S\n]*[-\u00AD\u2010][^\S\n]*\n\s*(?=\p{L})/gu, '$1')
 			// Discretionary soft hyphens are formatting even without a line break.
-			.replace(/\u00AD/g, ''))
+			.replace(/\u00AD/g, '')
+			// ponytail: OCR can omit a printed hyphen before the nonword
+			// fragments tion/tions; ambiguous splits need OCR/layout evidence.
+			.replace(/([\p{L}\p{M}])[^\S\n]*\n\s*(tions?)(?![\p{L}\p{M}\p{N}_])/gu, '$1$2'))
 			// Collapse runs of blank lines to exactly one paragraph break.
 			.replace(/\n{2,}/g, '\n\n')
 			// A lone newline is a line wrap, not a sentence end.
@@ -506,23 +566,29 @@
 	 * takes effect on the currently playing buffer instantly.
 	 */
 	function synthesize(text, signal) {
-		return fetch(ENDPOINT + '/v1/audio/speech', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({
-				model: 'kokoro',
-				voice: voice,
-				input: applyPronunciations(text),
-				response_format: FORMAT,
-				speed: 1
-			}),
-			// The endpoint may sit behind an nginx auth_request gate that reads
-			// the deployment's session cookie. Same-origin is fetch's default,
-			// but state it: without the cookie such a gate answers 401 and no
-			// audio is ever produced.
-			credentials: 'same-origin',
-			signal: signal
-		}).then(function (response) {
+		function requestAudio() {
+			return fetch(ENDPOINT + '/v1/audio/speech', {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					model: 'kokoro',
+					voice: voice,
+					input: applyPronunciations(text),
+					response_format: FORMAT,
+					speed: 1
+				}),
+				// The endpoint may sit behind an nginx auth_request gate that reads
+				// the deployment's session cookie. Same-origin is fetch's default,
+				// but state it: without the cookie such a gate answers 401 and no
+				// audio is ever produced.
+				credentials: 'same-origin',
+				signal: signal
+			});
+		}
+		var response = PRONUNCIATIONS_ENDPOINT
+			? refreshPronunciations().then(requestAudio)
+			: requestAudio();
+		return response.then(function (response) {
 			if (!response.ok) {
 				return response.text().catch(function () { return ''; })
 					.then(function (body) {
@@ -567,6 +633,7 @@
 	var voice = loadVoice();
 	var highlightStyle = loadHighlightStyle();
 	var surfacePaint = null;
+	var surfaceRepaintPending = false;
 	var SURFACE_STYLE_ID = 'ztts-surface-style';
 	var SURFACE_STYLE_TEXT = [
 		'.ztts-surface-layer{position:fixed;inset:0;z-index:2147483000;pointer-events:none;overflow:hidden;}',
@@ -598,7 +665,18 @@
 		audio.addEventListener('ended', function () {
 			if (!run || run.loading || !audio.src || audio.src !== run.parts[run.index].url) return;
 			run.pendingSeek = null;
-			playPart(run.index + 1, true);
+			if (run.parts[run.index].pauseAfter && run.index + 1 < run.parts.length) {
+				run.headingPause = { autoplay: true, timer: null, index: run.index + 1, delay: run.parts[run.index].pauseAfter };
+				scheduleHeadingPause();
+			}
+			else playPart(run.index + 1, true);
+		});
+		audio.addEventListener('seeking', function () {
+			if (!run || !run.headingPause) return;
+			var autoplay = run.headingPause.autoplay;
+			clearTimeout(run.headingPause.timer);
+			run.headingPause = null;
+			if (autoplay) audio.play().catch(function () { setPhase('paused'); });
 		});
 		audio.addEventListener('loadedmetadata', function () {
 			// Re-pin after the load algorithm has run, so the rate holds even
@@ -614,6 +692,18 @@
 			setError('Audio playback failed');
 		});
 		return audio;
+	}
+
+	// Keep the heading gap in wall-clock time: playbackRate must not shorten it.
+	function scheduleHeadingPause() {
+		var theRun = run;
+		var pause = theRun.headingPause;
+		pause.timer = setTimeout(function () {
+			if (run === theRun && theRun.headingPause === pause && pause.autoplay) {
+				playPart(pause.index, true, pause.index === theRun.index);
+			}
+		}, pause.delay);
+		setPhase('playing');
 	}
 
 	/**
@@ -710,6 +800,7 @@
 			cancelSurfaceScroll();
 			if (completed) clearReadProgress(run);
 			else saveReadProgress(true);
+			if (run.headingPause) clearTimeout(run.headingPause.timer);
 			run.controller.abort();
 			run.parts.forEach(releasePart);
 		}
@@ -783,8 +874,10 @@
 	 * Load part `index` and optionally start it. An out-of-range index is the
 	 * exit edge — "next" on the final part ends the job.
 	 */
-	function playPart(index, autoplay) {
+	function playPart(index, autoplay, skipHeadingPause) {
 		if (!run) return;
+		if (run.headingPause) clearTimeout(run.headingPause.timer);
+		run.headingPause = null;
 		if (index < 0 || index >= run.parts.length) {
 			stopRun(true);
 			return;
@@ -809,7 +902,7 @@
 		// A clip generated from a clicked word is only for that visit. After
 		// leaving it, later sequential playback must read the complete part.
 		if (previousIndex !== index && previous.startWord) {
-			theRun.parts[previousIndex] = createPart(previous.text);
+			theRun.parts[previousIndex] = createPart(previous.text, 0, previous.pauseAfter, previous.pauseBefore);
 			releasePart(previous);
 		}
 		setPhase('loading');
@@ -827,6 +920,14 @@
 			if (!autoplay) {
 				theRun.loading = false;
 				setPhase('paused');
+				return;
+			}
+			if (!skipHeadingPause && theRun.parts[index].pauseBefore) {
+				theRun.headingPause = {
+					autoplay: true, timer: null, index: index, delay: theRun.parts[index].pauseBefore
+				};
+				scheduleHeadingPause();
+				prefetchNext();
 				return;
 			}
 			var started = a.play();
@@ -861,11 +962,13 @@
 		});
 	}
 
-	function createPart(text, startWord) {
+	function createPart(text, startWord, pauseAfter, pauseBefore) {
 		var words = text.match(/\S+\s*/g) || [];
 		startWord = Math.min(Math.max(0, startWord || 0), Math.max(0, words.length - 1));
 		return {
 			text: text,
+			pauseAfter: pauseAfter || 0,
+			pauseBefore: pauseBefore || 0,
 			// Keep the complete part for matching and backwards jumps. If no
 			// timings exist, synthesize exactly from the requested word.
 			startWord: startWord,
@@ -890,10 +993,10 @@
 		options = options || {};
 		var normalized = normalizeForSpeech(text);
 		var key = source + ':' + normalized;
-		var chunks = splitTextForSpeech(normalized, CHUNK_MAX_CHARS);
+		var parts = speechParts(text);
 		var initial = options.surfaceHit && runPositionForSurfaceToken(
 			options.surfaceHit.tokens, options.surfaceHit.tokenIndex,
-			{ parts: chunks.map(function (chunk) { return createPart(chunk); }) }
+			{ parts: parts }
 		);
 		if (options.surfaceHit && !initial) return false;
 		if (run && run.key === key && !initial) {
@@ -901,13 +1004,13 @@
 			return;
 		}
 		stopRun();
-		if (!chunks.length) {
+		if (!parts.length) {
 			showBar();
 			setError('Nothing to read');
 			return;
 		}
 		var attachment = options.attachmentKey || null;
-		var progress = initial ? null : loadReadProgress(attachment, source, normalized, chunks.length);
+		var progress = initial ? null : loadReadProgress(attachment, source, normalized, parts.length);
 		run = {
 			key: key,
 			source: source,
@@ -925,9 +1028,11 @@
 			// Index of a part whose synthesis failed, so Play can retry it.
 			failed: null,
 			controller: new AbortController(),
-			parts: chunks.map(function (t, index) {
-				if (initial && initial.partIndex === index) return createPart(t, initial.wordIndex);
-				return createPart(t, progress && progress.index === index ? progress.startWord : 0);
+			headingPause: null,
+			parts: parts.map(function (part, index) {
+				var start = initial && initial.partIndex === index ? initial.wordIndex
+					: progress && progress.index === index ? progress.startWord : 0;
+				return start ? createPart(part.text, start, part.pauseAfter, part.pauseBefore) : part;
 			})
 		};
 		renderSurfaceFollow();
@@ -944,6 +1049,16 @@
 
 	function togglePlay() {
 		if (!run) return;
+		if (run.headingPause) {
+			var pause = run.headingPause;
+			pause.autoplay = !pause.autoplay;
+			if (pause.autoplay) scheduleHeadingPause();
+			else {
+				clearTimeout(pause.timer);
+				setPhase('paused');
+			}
+			return;
+		}
 		// A part whose synthesis failed left nothing loaded. Play then means
 		// "try that part again" — the useful action after a transient Kokoro
 		// error — rather than doing nothing, or replaying a neighbouring part.
@@ -982,12 +1097,12 @@
 			// `target` is negative: that many seconds before the previous
 			// part's end. Its duration is not known until it loads.
 			run.pendingSeek = { fromEnd: true, seconds: -target };
-			playPart(run.index - 1, !audio.paused);
+			playPart(run.index - 1, run.headingPause ? run.headingPause.autoplay : !audio.paused);
 			return;
 		}
 		if (duration > 0 && target > duration) {
 			run.pendingSeek = { fromEnd: false, seconds: target - duration };
-			playPart(run.index + 1, !audio.paused);
+			playPart(run.index + 1, run.headingPause ? run.headingPause.autoplay : !audio.paused);
 			return;
 		}
 		audio.currentTime = duration > 0 ? Math.min(target, duration) : target;
@@ -1022,13 +1137,13 @@
 			return;
 		}
 		run.pendingSeek = null;
-		playPart(run.index - 1, !audio.paused);
+		playPart(run.index - 1, run.headingPause ? run.headingPause.autoplay : !audio.paused);
 	}
 
 	function nextPart() {
 		if (!run) return;
 		run.pendingSeek = null;
-		playPart(run.index + 1, !(audio && audio.paused));
+		playPart(run.index + 1, run.headingPause ? run.headingPause.autoplay : !(audio && audio.paused));
 	}
 
 	/**
@@ -1048,13 +1163,13 @@
 		if (ui.voice) ui.voice.value = voice;
 		if (!run) return;
 		var at = audio && isFinite(audio.currentTime) ? audio.currentTime : 0;
-		var wasPlaying = !!(audio && !audio.paused);
+		var wasPlaying = run.headingPause ? run.headingPause.autoplay : !!(audio && !audio.paused);
 		var index = run.index;
 		run.controller.abort();
 		run.controller = new AbortController();
 		run.parts.forEach(releasePart);
 		run.parts = run.parts.map(function (part) {
-			return createPart(part.text, part.startWord);
+			return createPart(part.text, part.startWord, part.pauseAfter, part.pauseBefore);
 		});
 		run.failed = null;
 		run.pendingSeek = { fromEnd: false, seconds: at };
@@ -1606,6 +1721,10 @@
 				&& /[\p{L}\p{M}][-\u00AD\u2010]$/u.test(previous.text) && /^\p{L}/u.test(token.text)) {
 				joinedText = previous.text.slice(0, -1) + token.text;
 			}
+			else if (previous && previous.speechLine !== token.speechLine
+				&& /[\p{L}\p{M}]$/u.test(previous.text) && /^tions?$/.test(token.norm)) {
+				joinedText = previous.text + token.text;
+			}
 			if (joinedText !== null) {
 				previous.segments = (previous.segments || [Object.assign({}, previous)]).concat(token);
 				previous.text = joinedText;
@@ -1742,19 +1861,19 @@
 		if (!part || wordIndex < 0 || wordIndex >= partMatchWords(part).length) return false;
 		var at = part.url ? timeForWord(part, wordIndex) : null;
 		if (at === null && part.url && wordIndex === part.startWord) at = 0;
-		if (partIndex === run.index && !run.loading && audio && audio.src === part.url && at !== null) {
+		if (partIndex === run.index && !run.loading && !run.headingPause && audio && audio.src === part.url && at !== null) {
 			run.pendingSeek = null;
 			audio.currentTime = Math.max(0, at - 0.08);
 			saveReadProgress(true);
 			paintHighlight(true);
 			return true;
 		}
-		var autoplay = run.loading ? run.autoplay : !!(audio && !audio.paused);
+		var autoplay = run.headingPause ? run.headingPause.autoplay : run.loading ? run.autoplay : !!(audio && !audio.paused);
 		saveReadProgress(true);
 		if (at === null) {
 			// A new part object also invalidates synthesis/alignment already
 			// in flight for this part. Late results cannot replace this jump.
-			run.parts[partIndex] = createPart(part.text, wordIndex);
+			run.parts[partIndex] = createPart(part.text, wordIndex, part.pauseAfter, part.pauseBefore);
 			at = 0;
 		}
 		run.pendingSeek = { fromEnd: false, seconds: Math.max(0, at - 0.08) };
@@ -2179,7 +2298,19 @@
 			clearSurfaceHighlight();
 			return false;
 		}
-		var target = locateSurfaceWord(part, active);
+		// Scrolling changes geometry, not the word's text anchor. Re-scanning
+		// every rendered word on each scroll frame stalls long documents and
+		// can choose a different occurrence as PDF text layers are recycled.
+		var target = part.surfaceTarget;
+		var token = target && target.tokens[target.tokenIndex];
+		if (!target || target.activeWord !== active || !token
+			|| !(token.segments || [token]).every(function (segment) {
+				return segment.node.isConnected
+					&& segment.node.nodeValue.slice(segment.start, segment.end) === segment.text;
+			})) {
+			target = locateSurfaceWord(part, active);
+			part.surfaceTarget = target;
+		}
 		if (!target) {
 			if (follow) followUnrenderedPdfWord(part, active);
 			clearSurfaceHighlight();
@@ -2215,6 +2346,21 @@
 		}
 		if (ui.bar) ui.bar.classList.add('ztts-surface-active');
 		return true;
+	}
+
+	function scheduleSurfaceRepaint() {
+		if (!ALIGNMENT_ENDPOINT || surfaceRepaintPending) return;
+		surfaceRepaintPending = true;
+		window.requestAnimationFrame(function () {
+			surfaceRepaintPending = false;
+			if (!run || !audio) return;
+			var part = run.parts[run.index];
+			if (!part || !part.readAlong || audio.src !== part.url) return;
+			// Leave playback updates to the audio clock. A scroll only needs
+			// fresh rectangles for the highlight, and must never navigate.
+			var active = activeWordForPart(part, audio.currentTime);
+			paintSurfaceHighlight(part, active, sentenceRangeForWord(part.readAlong.words, active), false);
+		});
 	}
 
 	function paintHighlight(force, follow) {
@@ -2505,6 +2651,22 @@
 		var rows = pdfTextRows(fragments);
 		var gutter = pdfColumnGutter(rows, left, right);
 		if (gutter === null) gutter = pdfSeparatedColumnGutter(rows, left, right);
+		// A large blank band can separate layouts with different column widths
+		// (for example, a wide abstract/sidebar above equal article columns).
+		var bands = [[]];
+		rows.forEach(function (row, index) {
+			var previous = rows[index - 1];
+			if (previous && row.y - previous.y > Math.max(previous.size, row.size) * 3) bands.push([]);
+			Array.prototype.push.apply(bands[bands.length - 1], row.fragments);
+		});
+		if (bands.length > 1 && bands.some(function (band) {
+			var bandRows = pdfTextRows(band);
+			var bandGutter = pdfColumnGutter(bandRows, left, right);
+			if (bandGutter === null) bandGutter = pdfSeparatedColumnGutter(bandRows, left, right);
+			return bandGutter !== null && (gutter === null || Math.abs(bandGutter - gutter) > (right - left) * 0.025);
+		})) {
+			return bands.reduce(function (lines, band) { return lines.concat(pdfReadingOrder(band, left, right)); }, []);
+		}
 		if (gutter === null) {
 			if (rows.length >= 3) return rows.map(pdfMergeRow);
 			// Sparse rows cannot establish recurring columns. Keep widely
@@ -2585,7 +2747,35 @@
 		});
 		return pages.map(function (page, index) {
 			if (isPdfMetadataPage(page)) return '';
-			var text = pdfBodyLines(page, repeated).map(function (line) { return line.text.trim(); }).join('\n');
+			var lines = pdfBodyLines(page, repeated);
+			var bodySize = pdfBodyFontSize(page);
+			var out = [];
+			var previousHeading = null;
+			lines.forEach(function (line, i) {
+				var value = line.text.trim();
+				var previous = lines[i - 1];
+				var next = lines[i + 1];
+				// ponytail: untagged PDF headings use type size and isolated short
+				// lines; add structure-tree roles for ambiguous body-size headings.
+				var heading = bodySize && value.length < 160 && /\p{L}/u.test(value)
+					&& !/[.!?;,:]$/.test(value) && !/^\d+[.)]?\s/.test(value)
+					&& !line.fragments.some(function (fragment) {
+						return /^[A-Z]$/.test(fragment.text.trim()) && fragment.size > bodySize * 1.8;
+					})
+					&& (line.size >= bodySize * 1.15
+						|| (value.length < 80 && line.size < bodySize * 0.95
+							&& previous && next && line.y - previous.y > line.size * 1.7
+							&& next.y > line.y && next.y - line.y < line.size * 3
+							&& Math.abs(next.left - line.left) < bodySize * 3));
+				if (heading && previousHeading && line.y > previousHeading.y
+					&& line.y - previousHeading.y < line.size * 2.2
+					&& Math.abs(line.size - previousHeading.size) < line.size * 0.1) {
+					out[out.length - 1] += ' ' + value;
+				}
+				else out.push((heading ? '# ' : '') + value);
+				previousHeading = heading ? line : null;
+			});
+			var text = out.join('\n');
 			if (onPage) onPage(text, index + 1);
 			return text;
 		}).filter(Boolean).join('\n\n');
@@ -3005,9 +3195,7 @@
 					&& !(target.closest && target.closest('.ztts-bar, #sidebarContainer, .sidebar'))) {
 					suspendSurfaceFollow();
 				}
-				window.requestAnimationFrame(function () {
-					paintHighlight(true, false);
-				});
+				scheduleSurfaceRepaint();
 			}
 		}, true);
 	}

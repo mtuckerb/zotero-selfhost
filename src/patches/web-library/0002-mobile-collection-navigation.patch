@@ -1,0 +1,91 @@
+--- a/src/js/component/libraries/collection-tree.jsx
++++ b/src/js/component/libraries/collection-tree.jsx
+@@ -107,7 +107,7 @@
+ 		});
+ 	}, [parentCollectionKey, selectNode]);
+ 
+-	if ([PICKS_SINGLE_COLLECTION, PICKS_MULTIPLE_COLLECTIONS].includes(pickerMode) || !isTouchOrSmall) {
++	if ((!pickerMode && parentCollectionKey) || [PICKS_SINGLE_COLLECTION, PICKS_MULTIPLE_COLLECTIONS].includes(pickerMode) || !isTouchOrSmall) {
+ 		return null;
+ 	}
+ 
+@@ -627,9 +627,9 @@
+ 			// selection means picking, users should not be able to select a
+ 			// `pickerSkip` collection in picker mode.
+ 		} else if (!isDisabled && (isTouchOrSmall || (!isTouchOrSmall && !pickerMode) || (!isTouchOrSmall && pickerMode && !isPickerSkip) )) {
+-			selectNode({ collection: collection.key, view: 'collection' });
+-		}
+-	}, [pickerPicksCollection, isPickerSkip, isTouchOrSmall, isDisabled, pickerMode, pickerPick, collection.key, parentLibraryKey, selectNode]);
++			selectNode({ collection: collection.key, view: isSingleColumn && !pickerMode ? 'item-list' : 'collection' });
++		}
++	}, [pickerPicksCollection, isPickerSkip, isTouchOrSmall, isSingleColumn, isDisabled, pickerMode, pickerPick, collection.key, parentLibraryKey, selectNode]);
+ 
+ 	const handleRenameTrigger = useCallback(() => {
+ 		if (isTouchOrSmall || isReadOnly || pickerMode) {
+@@ -699,7 +699,7 @@
+ 		return onOpen(ev);
+ 	}, [isDisabled, onOpen])
+ 
+-	const usesItemsNode = (!pickerMode && isSingleColumn) || [PICKS_SINGLE_ITEM, PICKS_MULTIPLE_ITEMS].includes(pickerMode);
++	const usesItemsNode = [PICKS_SINGLE_ITEM, PICKS_MULTIPLE_ITEMS].includes(pickerMode);
+ 
+ 	const collections = allCollections.filter(c => c.parentCollection === collection.key && !c.deleted);
+ 	const hasSubCollections = collections.length > 0;
+@@ -769,7 +769,7 @@
+ 			onNodeDrop={ isTouchOrSmall ? null : handleNodeDrop }
+ 			onFileDrop={ isTouchOrSmall ? null : handleFileDrop }
+ 			onOpen={ handleOpen }
+-			onRename={ isTouchOrSmall ? null : handleRenameTrigger }
++			onRename={ isTouchOrSmall ? undefined : handleRenameTrigger }
+ 			onRenameCancel={ isTouchOrSmall ? null : handleRenameCancel }
+ 			onKeyDown={ handleNodeKeyDown }
+ 			shouldBeDraggable={!pickerMode && renaming !== collection.key }
+@@ -825,6 +825,20 @@
+ 						>
+ 							{ collectionName }
+ 						</div>
++						{isSingleColumn && !pickerMode && hasSubCollections && (
++							<button
++								type="button"
++								className="btn btn-icon"
++								aria-label={`Browse subcollections of ${collectionName}`}
++								onMouseDown={stopPropagation}
++								onClick={ev => {
++									ev.stopPropagation();
++									selectNode({ collection: collection.key, view: 'collection' });
++								}}
++							>
++								<Icon type="28/folders" width="28" height="28" />
++							</button>
++						)}
+ 						{pickerMode ? null : (
+ 							<DotMenu
+ 								collection = { collection }
+@@ -935,7 +949,6 @@
+ 	const prevCollection = usePrevious(currentCollection);
+ 
+ 	const isTouchOrSmall = useSelector(state => state.device.isTouchOrSmall);
+-	const isSingleColumn = useSelector(state => state.device.isSingleColumn);
+ 	const isFirstRendering = useSelector(state => state.current.isFirstRendering);
+ 
+ 	const highlightedCollections = useSelector(state => state.current.highlightedCollections);
+@@ -944,7 +957,7 @@
+ 	const isCurrentLibrary = pickerMode
+ 		? !!dataObjects?.[currentCollectionKey]
+ 		: parentLibraryKey === stateSelectedLibraryKey;
+-	const usesItemsNode = (!pickerMode && isSingleColumn) || [PICKS_SINGLE_ITEM, PICKS_MULTIPLE_ITEMS].includes(pickerMode);
++	const usesItemsNode = [PICKS_SINGLE_ITEM, PICKS_MULTIPLE_ITEMS].includes(pickerMode);
+ 	const allCollections = useMemo(() => Object.values(dataObjects ?? {}).filter(dataObject => dataObject[Symbol.for('type')] === 'collection'), [dataObjects]);
+ 
+ 	const path = useMemo(
+--- a/src/js/component/touch-header-wrap.jsx
++++ b/src/js/component/touch-header-wrap.jsx
+@@ -148,7 +148,7 @@
+ 			touchHeaderPath = [
+ 				ROOT_NODE,
+ 				...path,
+-				isItemsView ? itemsSourceNode : null,
++				isItemsView && itemsSource !== 'collection' ? itemsSourceNode : null,
+ 				itemNode,
+ 				drilldownNode
+ 			];

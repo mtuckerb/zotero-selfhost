@@ -172,6 +172,64 @@ test('visible word changes and highlight repaints leave every ancestor viewport 
 	assert.ok(await frame.locator('.ztts-surface-ball').count());
 });
 
+test('scroll repaints reuse the spoken word anchor instead of scanning every word', async t => {
+	const { page, frame } = await reader(t);
+	await frame.evaluate(() => {
+		window.rangeReads = 0;
+		const original = Range.prototype.getClientRects;
+		Range.prototype.getClientRects = function () {
+			window.rangeReads++;
+			return original.call(this);
+		};
+	});
+	await page.evaluate(() => {
+		for (let i = 0; i < 20; i++) tts.repaint();
+	});
+	const reads = await frame.evaluate(() => window.rangeReads);
+	assert.ok(reads <= 40, `20 repaints should measure only the spoken word, saw ${reads} range reads`);
+
+	await frame.evaluate(() => {
+		window.rangeReads = 0;
+		for (let i = 0; i < 20; i++) {
+			PDFViewerApplication.pdfViewer.container.dispatchEvent(new Event('scroll'));
+		}
+	});
+	await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+	const scrollReads = await frame.evaluate(() => window.rangeReads);
+	assert.ok(scrollReads > 0 && scrollReads <= 2,
+		`a burst of scroll events should repaint once, saw ${scrollReads} range reads`);
+});
+
+test('cached word anchors track movement and recover after a PDF text layer is replaced', async t => {
+	const { page, frame } = await reader(t);
+	const ballTop = () => frame.locator('.ztts-surface-ball').evaluate(el => el.getBoundingClientRect().top);
+	const initial = await ballTop();
+	await frame.locator('.page[data-page-number="1"] .textLayer').evaluate(layer => {
+		layer.style.transform = 'translateY(12px)';
+	});
+	await page.evaluate(() => tts.repaint());
+	assert.equal(await ballTop(), initial + 12, 'a cached anchor must still measure fresh geometry');
+	await frame.locator('.page[data-page-number="1"] .textLayer').evaluate(layer => {
+		layer.replaceChildren(...Array.from(layer.childNodes, node => node.cloneNode(true)));
+		layer.style.transform = 'translateY(24px)';
+	});
+	await page.evaluate(() => tts.repaint());
+	assert.equal(await ballTop(), initial + 24, 'a detached anchor must be resolved against the new text layer');
+});
+
+test('pausing following does not resize the reader at narrow toolbar wrap points', async t => {
+	const { page } = await reader(t);
+	for (let width = 460; width <= 1000; width += 20) {
+		await page.setViewportSize({ width, height: 800 });
+		const height = await page.locator('.reader-wrapper > iframe').evaluate(el => el.clientHeight);
+		await page.getByRole('button', { name: 'Following reading', exact: true }).click();
+		assert.equal(await page.locator('.reader-wrapper > iframe').evaluate(el => el.clientHeight), height,
+			`detaching must preserve the reader height at width ${width}`);
+		await page.getByRole('button', { name: 'Follow reading', exact: true }).click();
+		await page.waitForFunction(() => !tts.moving);
+	}
+});
+
 test('wheel browsing stays detached through later words and page boundaries, and Follow reading returns', async t => {
 	const { page, frame, top } = await reader(t);
 	await page.mouse.move(700, 450);

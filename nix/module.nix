@@ -342,6 +342,8 @@ let
     src = cfg.webLibrarySrc;
     patches = [
       ../src/patches/web-library/0001-all-attachment-metadata-and-automatic-parent.patch
+      ../src/patches/web-library/0002-mobile-collection-navigation.patch
+      ../src/patches/web-library/0003-validate-recognized-metadata.patch
     ];
     # curl + unzip are needed by scripts/fetch-or-build-modules.mjs which
     # downloads pre-built reader/pdf-worker/note-editor zips from
@@ -490,6 +492,10 @@ let
     endpoint = "/reader-tts";
     voice = cfg.webLibrary.readerTts.voice;
     pronunciations = cfg.webLibrary.readerTts.pronunciations;
+    pronunciationsEndpoint =
+      if cfg.webLibrary.readerTts.pronunciationsUrl != null
+      then "/reader-tts-pronunciations"
+      else null;
     format = cfg.webLibrary.readerTts.format;
     seekStepSec = cfg.webLibrary.readerTts.seekStepSec;
     chunkMaxChars = cfg.webLibrary.readerTts.chunkMaxChars;
@@ -624,6 +630,17 @@ let
         # default would cut off the slower ones.
         proxy_read_timeout 300s;
         proxy_send_timeout 300s;
+      '' + lib.optionalString (cfg.webLibrary.readerTts.authRequest != null) ''
+        auth_request ${cfg.webLibrary.readerTts.authRequest};
+      '';
+    } // (lib.optionalAttrs (cfg.webLibrary.basicAuthFile != null) {
+      basicAuthFile = cfg.webLibrary.basicAuthFile;
+    });
+  } // lib.optionalAttrs (cfg.webLibrary.readerTts.pronunciationsUrl != null) {
+    "= /reader-tts-pronunciations" = {
+      proxyPass = cfg.webLibrary.readerTts.pronunciationsUrl;
+      extraConfig = ''
+        proxy_read_timeout 15s;
       '' + lib.optionalString (cfg.webLibrary.readerTts.authRequest != null) ''
         auth_request ${cfg.webLibrary.readerTts.authRequest};
       '';
@@ -1131,7 +1148,7 @@ in {
 
     webLibraryHash = mkOption {
       type = types.str;
-      default = "sha256-3xydMxs7d+lVX6cAdRlgh70uJkquKvOuYEKtmXoPbH8=";
+      default = "sha256-iT6jL8FOfPxeFiREHvCaHaUIAvIxo5VsgXJMmgPZlc8=";
       description = ''
         SRI hash of the built web-library bundle (the result of
         `npm install && npm run build`). The build is wrapped as a
@@ -1632,6 +1649,19 @@ in {
             displayed text, seeking, and alignment keep the source words.
             The default reads meso as MEH-zoh. Set to {} to disable.
             Use Kokoro's /dev/phonemize endpoint to check phoneme strings.
+          '';
+        };
+
+        pronunciationsUrl = mkOption {
+          type = types.nullOr types.str;
+          default = null;
+          example = "http://127.0.0.1:1800/fresh/api/pronunciations";
+          description = ''
+            Optional OpenBrain pronunciation-registry URL. nginx exposes it
+            to the browser at `/reader-tts-pronunciations`, and the overlay
+            refreshes it before each synthesis request. The local
+            `pronunciations` dictionary remains the startup and failure
+            fallback. Set to null to use only the local dictionary.
           '';
         };
 

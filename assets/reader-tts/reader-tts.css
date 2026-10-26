@@ -75,6 +75,14 @@
 	border-color: var(--accent-blue, #2e7fe4);
 }
 
+/* Changing the follow label during a wheel gesture must not wrap the
+   toolbar onto another row and resize/reflow the document being scrolled. */
+.ztts-surface-follow {
+	min-width: 10.5em;
+	flex-shrink: 0;
+	white-space: nowrap;
+}
+
 .ztts-btn:disabled {
 	opacity: 0.5;
 	cursor: default;
