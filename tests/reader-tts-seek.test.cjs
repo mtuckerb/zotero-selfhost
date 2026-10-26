@@ -367,6 +367,59 @@ test('changing voice after a jump preserves its word offset', async () => {
  assert.equal(r.api.audio.currentTime, 3);
 });
 
+test('Command-click starts idle or stopped playback at the clicked word', async () => {
+ const r = reader();
+ for (let attempt = 0; attempt < 2; attempt++) {
+  const { handled, event } = r.click('final topic');
+  assert.equal(handled, true);
+  assert.equal(event.prevented, true);
+  assert.equal(event.stopped, true);
+  await settle();
+  assert.equal(r.api.run.source, 'document');
+  assert.equal(r.api.run.index, 2);
+  assert.equal(r.clips.get(r.api.audio.src), 'final topic with a memorable conclusion.');
+  assert.equal(r.api.audio.paused, false);
+  r.api.stopRun();
+ }
+});
+
+test('idle clicks ignore ordinary clicks, secondary clicks and empty space', () => {
+ const r = reader();
+ for (const overrides of [{ metaKey: false }, { button: 2 }, { clientY: 100 }]) {
+  const { handled, event } = r.click('final topic', overrides);
+  assert.equal(handled, false);
+  assert.equal(event.prevented, undefined);
+ }
+ assert.equal(r.documentRequests.length, 0);
+});
+
+test('the latest idle click wins and stopping cancels pending document loading', async () => {
+ const r = reader({ fulltextDeferred: true });
+ r.click('second topic');
+ r.click('final topic');
+ r.documentRequests[1].resolve(); await settle();
+ r.documentRequests[0].resolve(); await settle();
+ assert.equal(r.clips.get(r.api.audio.src), 'final topic with a memorable conclusion.');
+ r.api.stopRun();
+ r.click('second topic');
+ r.api.stopRun();
+ r.documentRequests[2].resolve(); await settle();
+ assert.equal(r.api.run, null);
+ assert.equal(r.api.audio.paused, true);
+ assert.equal(r.api.audio.src, '');
+});
+
+test('failed idle document loading permits a later click to retry', async () => {
+ const r = reader({ fulltextDeferred: true });
+ r.click('final topic');
+ r.documentRequests[0].reject(new Error('Document unavailable')); await settle();
+ assert.equal(r.api.run, null);
+ r.click('second topic');
+ r.documentRequests[1].resolve(); await settle();
+ assert.equal(r.api.run.index, 1);
+ assert.equal(r.api.audio.paused, false);
+});
+
 test('Command-click outside Read selection expands playback to the complete document', async () => {
  const r = reader();
  r.api.startRun('selection', paragraphs[0]); await settle();

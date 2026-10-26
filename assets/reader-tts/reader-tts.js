@@ -1763,12 +1763,12 @@
 		return true;
 	}
 
-	function seekToSurfacePoint(doc, clientX, clientY, event) {
-		if (!run) return false;
+	function seekToSurfacePoint(doc, clientX, clientY, event, startIfIdle) {
+		if (!run && !startIfIdle) return false;
 		var hit = tokenAtPoint(doc, clientX, clientY);
 		if (!hit) return false;
-		var position = runPositionForSurfaceToken(hit.tokens, hit.tokenIndex);
-		if (!position && run.source !== 'selection') return false;
+		var position = run && runPositionForSurfaceToken(hit.tokens, hit.tokenIndex);
+		if (!position && run && run.source !== 'selection') return false;
 		if (event) {
 			event.preventDefault();
 			event.stopPropagation();
@@ -1792,7 +1792,7 @@
 	function seekToSurfaceClick(doc, event) {
 		if (!(event.metaKey || event.ctrlKey)) return false;
 		if (event.button !== undefined && event.button !== 0) return false;
-		return seekToSurfacePoint(doc, event.clientX, event.clientY, event);
+		return seekToSurfacePoint(doc, event.clientX, event.clientY, event, true);
 	}
 
 	function selectionTextForDoc(doc) {
@@ -2750,12 +2750,16 @@
 		var previous = run;
 		var key = attachmentKey();
 		var request = ++documentReadRequest;
-		var autoplay = previous.loading ? previous.autoplay : !!(audio && !audio.paused);
-		previous.loading = true;
-		previous.autoplay = autoplay;
-		previous.playRequest = {};
+		var autoplay = !previous || (previous.loading ? previous.autoplay : !!(audio && !audio.paused));
+		if (previous) {
+			previous.loading = true;
+			previous.autoplay = autoplay;
+			previous.playRequest = {};
+		}
 		if (audio) audio.pause();
+		showBar();
 		setPhase('loading');
+		setError(null);
 		fetchDocumentText().then(function (text) {
 			if (request !== documentReadRequest || run !== previous || attachmentKey() !== key) return;
 			if (!startRun('document', text, { attachmentKey: key, surfaceHit: hit, autoplay: autoplay })) {
@@ -2763,8 +2767,10 @@
 			}
 		}).catch(function (err) {
 			if (request !== documentReadRequest || run !== previous || attachmentKey() !== key) return;
-			previous.loading = false;
-			if (!audio || !audio.src) previous.failed = previous.index;
+			if (previous) {
+				previous.loading = false;
+				if (!audio || !audio.src) previous.failed = previous.index;
+			}
 			setPhase('paused');
 			setError(err && err.message ? err.message : 'Could not load full text');
 		});
