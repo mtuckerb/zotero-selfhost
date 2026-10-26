@@ -1,0 +1,153 @@
+--- a/src/js/actions/items-write.js
++++ b/src/js/actions/items-write.js
+@@ -11,6 +11,9 @@
+ import { parseDescriptiveString } from '../common/format';
+ import { sniffForMIMEType } from '../common/mime';
+ import { READER_CONTENT_TYPES } from '../constants/reader';
++import { retrieveMetadata } from './recognize';
++import { toggleModal } from '.';
++import { METADATA_RETRIEVAL } from '../constants/modals';
+ 
+ import {
+ 	BEGIN_ONGOING,
+@@ -1621,6 +1624,10 @@
+ 			const uploadPromises = createdItems.map(async (item, index) => {
+ 				const fd = filesData[index];
+ 				await dispatch(uploadAttachment(item.key, fd, libraryKey));
++				if (!item.parentItem) {
++					dispatch(toggleModal(METADATA_RETRIEVAL, true));
++					await dispatch(retrieveMetadata(item.key, libraryKey));
++				}
+ 			});
+ 
+ 			await Promise.all(uploadPromises);
+--- a/src/js/component/item/actions/import.jsx
++++ b/src/js/component/item/actions/import.jsx
+@@ -3,13 +3,14 @@
+ import { useDispatch, useSelector } from 'react-redux';
+ import { Button, DropdownItem, Icon } from 'web-common/components';
+ 
+-import { importFromFile, toggleModal } from '../../../actions';
++import { createAttachments, importFromFile, toggleModal } from '../../../actions';
+ import { getFileData } from '../../../common/event';
+ import { IDENTIFIER_PICKER } from '../../../constants/modals';
+ 
+ 
+ const ImportAction = ({ disabled, onFocusNext, onFocusPrev, tabIndex }) => {
+ 	const dispatch = useDispatch();
++	const collectionKey = useSelector(state => state.current.collectionKey);
+ 	const isTouchOrSmall = useSelector(state => state.device.isTouchOrSmall);
+ 	const uploadFileId = useId();
+ 	const fileInputRef = useRef(null);
+@@ -38,10 +39,14 @@
+ 		const fileData = await getFileData(target.files[0]);
+ 		target.value = ''; // clear the invisible input so that onChange is triggered even if the same file is selected again
+ 		if (fileData) {
++			if (/\.(pdf|epub|docx|odt|html?)$/i.test(fileData.fileName)) {
++				dispatch(createAttachments([fileData], { collection: collectionKey }));
++				return;
++			}
+ 			dispatch(importFromFile(fileData));
+ 			dispatch(toggleModal(IDENTIFIER_PICKER, true));
+ 		}
+-	}, [dispatch]);
++	}, [collectionKey, dispatch]);
+ 
+ 	return isTouchOrSmall ? (
+ 		<DropdownItem
+--- /dev/null
++++ b/test/automatic-metadata.test.js
+@@ -0,0 +1,58 @@
++/* @jest-environment ./test/utils/zotero-env.js */
++import { http, HttpResponse } from 'msw';
++import { setupServer } from 'msw/node';
++import { setupStore } from '../src/js/store';
++import { createAttachments, createAttachmentsFromDropped } from '../src/js/actions/items-write';
++import { retrieveMetadata } from '../src/js/actions/recognize';
++import { JSONtoState } from './utils/state';
++import { setupMSWLifecycle } from './utils/msw-lifecycle';
++import stateRaw from './fixtures/state/desktop-test-user-top-level-attachment-view.json';
++import template from './fixtures/response/new-item-file-attachment.json';
++import created from './fixtures/response/test-user-add-new-attachment-file.json';
++
++jest.mock('../src/js/actions/recognize', () => ({
++ ...jest.requireActual('../src/js/actions/recognize'),
++ retrieveMetadata: jest.fn(() => ({ type: 'TEST_RETRIEVE_METADATA' })),
++}));
++
++const server = setupServer();
++setupMSWLifecycle(server);
++
++test.each([
++ ['button', 'application/pdf', null, false],
++ ['drop', 'application/epub+zip', null, false],
++ ['button', 'text/plain', null, false],
++ ['button', 'application/pdf', 'PARENT01', false],
++ ['button', 'application/pdf', null, true],
++])('%s import of %s, parent=%s, upload failure=%s', async (source, contentType, parentItem, fail) => {
++ const store = setupStore(JSONtoState(stateRaw));
++ let uploaded = false;
++ retrieveMetadata.mockClear();
++ retrieveMetadata.mockImplementation(() => {
++  expect(uploaded).toBe(true);
++  return { type: 'TEST_RETRIEVE_METADATA' };
++ });
++ server.use(
++  http.get('https://api.zotero.org/items/new', () => HttpResponse.json(template)),
++  http.post('https://api.zotero.org/users/1/items', async ({ request }) => {
++   const [item] = await request.json();
++   const response = JSON.parse(JSON.stringify(created));
++   Object.assign(response.successful[0].data, item);
++   return HttpResponse.json(response);
++  }),
++  http.post('https://api.zotero.org/users/1/items/FFIILLEE/file', () => {
++   if (fail) return new HttpResponse('Upload failed', { status: 400 });
++   uploaded = true;
++   return HttpResponse.json({ exists: 1 });
++  }),
++  http.get('https://api.zotero.org/users/1/items', () => HttpResponse.json([], { headers: { 'Total-Results': '0' } })),
++ );
++ const options = { libraryKey: 'u1', parentItem };
++ const action = source === 'drop'
++  ? createAttachmentsFromDropped([new File(['test'], 'sample.epub', { type: contentType })], options)
++  : createAttachments([{ file: new Uint8Array([1, 2, 3, 4]).buffer, fileName: 'sample', contentType }], options);
++ if (fail) await expect(store.dispatch(action)).rejects.toThrow();
++ else await store.dispatch(action);
++ if (fail || parentItem) expect(retrieveMetadata).not.toHaveBeenCalled();
++ else expect(retrieveMetadata).toHaveBeenCalledWith('FFIILLEE', 'u1');
++});
+--- /dev/null
++++ b/test/automatic-import-button.test.jsx
+@@ -0,0 +1,32 @@
++/* @jest-environment ./test/utils/zotero-env.js */
++import { waitFor } from '@testing-library/react';
++import userEvent from '@testing-library/user-event';
++import { createAttachments, importFromFile } from '../src/js/actions';
++import ImportAction from '../src/js/component/item/actions/import';
++import { renderWithProviders } from './utils/render';
++import { JSONtoState } from './utils/state';
++import stateRaw from './fixtures/state/desktop-test-user-top-level-attachment-view.json';
++
++jest.mock('../src/js/actions', () => ({
++ ...jest.requireActual('../src/js/actions'),
++ createAttachments: jest.fn(() => ({ type: 'TEST_IMPORT_DOCUMENT' })),
++ importFromFile: jest.fn(() => ({ type: 'TEST_IMPORT_BIBLIOGRAPHY' })),
++}));
++
++test.each(['pdf', 'epub', 'docx', 'odt', 'html', 'ris'])('Import button handles %s', async extension => {
++ createAttachments.mockClear();
++ importFromFile.mockClear();
++ const state = JSONtoState(stateRaw);
++ const { container } = renderWithProviders(<ImportAction />, { preloadedState: state });
++ await userEvent.upload(container.querySelector('input'), new File(['test'], `sample.${extension}`));
++ if (extension === 'ris') {
++  await waitFor(() => expect(importFromFile).toHaveBeenCalledTimes(1));
++  expect(createAttachments).not.toHaveBeenCalled();
++ } else {
++  await waitFor(() => expect(createAttachments).toHaveBeenCalledWith(
++   [expect.objectContaining({ fileName: `sample.${extension}` })],
++   { collection: state.current.collectionKey }
++  ));
++  expect(importFromFile).not.toHaveBeenCalled();
++ }
++});

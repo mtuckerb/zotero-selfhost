@@ -1,5 +1,20 @@
 # Attachment metadata and automatic parent items
 
+Standalone file imports automatically retrieve metadata after each successful
+upload. Drag/drop, Upload File, and document imports through Import From a File
+share this workflow. PDF, EPUB, DOCX, ODT, and HTML files use the document path;
+bibliography files retain the translator import path. The retrieval dialog
+shows progress, review warnings, and failures. Files uploaded to an existing
+parent keep that parent and its metadata.
+
+The connector starts server metadata retrieval after storing standalone files,
+without delaying the save response. PDFs use recognition, EPUBs use embedded
+book metadata, and other files receive review-marked file-detail metadata.
+Failures retain the attachment for manual retrieval. Import-time retrieval
+replaces the old admin-only PDF sweep to avoid competing parent creation.
+The web import hook is packaged in
+`src/patches/web-library/0004-automatic-import-metadata.patch`.
+
 The web-library patch in
 `src/patches/web-library/0001-all-attachment-metadata-and-automatic-parent.patch`
 enables Retrieve Metadata for every standalone attachment type in writable

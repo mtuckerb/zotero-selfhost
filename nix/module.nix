@@ -344,6 +344,7 @@ let
       ../src/patches/web-library/0001-all-attachment-metadata-and-automatic-parent.patch
       ../src/patches/web-library/0002-mobile-collection-navigation.patch
       ../src/patches/web-library/0003-validate-recognized-metadata.patch
+      ../src/patches/web-library/0004-automatic-import-metadata.patch
     ];
     # curl + unzip are needed by scripts/fetch-or-build-modules.mjs which
     # downloads pre-built reader/pdf-worker/note-editor zips from
@@ -457,6 +458,8 @@ let
       # collect-locale and build-styles-json above generate data imported by
       # the store-backed workflow tests, so this must run after preparation.
       npx jest \
+        test/automatic-metadata.test.js \
+        test/automatic-import-button.test.jsx \
         test/attachment-metadata.test.js \
         test/metadata-workflows.test.jsx \
         test/recognize.test.jsx \
@@ -1148,7 +1151,7 @@ in {
 
     webLibraryHash = mkOption {
       type = types.str;
-      default = "sha256-iT6jL8FOfPxeFiREHvCaHaUIAvIxo5VsgXJMmgPZlc8=";
+      default = "sha256-t4v08Sveg2vBquP6YMeqXhaTcb4uGMEwzXynbVTmhpI=";
       description = ''
         SRI hash of the built web-library bundle (the result of
         `npm install && npm run build`). The build is wrapped as a
