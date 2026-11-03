@@ -9,6 +9,7 @@ function readerApi(overrides = {}) {
  const context = {
   document: { getElementById: () => null },
   localStorage: { getItem: () => null },
+  setTimeout, clearTimeout,
   ...overrides
  };
  vm.runInNewContext(source.replace(
@@ -189,6 +190,32 @@ test('retries failed extraction without caching errors', async () => {
  assert.match(await api.fetchPdfDocumentText(pdf), /page 1/);
 });
 
+test('a stalled PDF page expires and retry does not reuse the stalled extraction', async () => {
+ let expire;
+ const timers = new Set();
+ const reader = readerApi({
+  setTimeout: callback => { expire = callback; timers.add(callback); return callback; },
+  clearTimeout: callback => timers.delete(callback)
+ });
+ const pdf = pdfMock(1), getPage = pdf.getPage;
+ let finishStalled;
+ pdf.getPage = () => new Promise(resolve => { finishStalled = resolve; });
+ const stalled = reader.fetchPdfDocumentText(pdf);
+ const rejected = assert.rejects(stalled, /page 1.*timed out/i);
+ await new Promise(resolve => setImmediate(resolve));
+ assert.equal(typeof expire, 'function', 'PDF extraction must have a deadline');
+ expire();
+ await rejected;
+ assert.equal(timers.size, 0);
+ pdf.getPage = getPage;
+ const recovered = await reader.fetchPdfDocumentText(pdf);
+ assert.match(recovered, /page 1/);
+ finishStalled(await getPage(1));
+ await new Promise(resolve => setImmediate(resolve));
+ assert.equal(await reader.fetchPdfDocumentText(pdf), recovered);
+ assert.equal(timers.size, 0);
+});
+
 test('PDF extraction never falls back to the unfiltered full-text index', async () => {
  let fetched = false;
  const pdf = pdfMock(1);
@@ -218,6 +245,34 @@ test('reads complete columns despite interleaved PDF drawing order', () => {
  assert.equal(text, [1,2,3,4,5].map(n=>'Left row '+n+' ends here.').concat([1,2,3,4,5].map(n=>'Right row '+n+' ends here.')).join('\n'));
 });
 
+test('separates an offset abstract sidebar from equal-width article columns below it', () => {
+ const items = [item('Article title', { x: 38, y: 180, width: 420, size: 16 })];
+ for (let n = 0; n < 16; n++) {
+  items.push(item('Abstract row ' + n, { x: 38, y: 354 + n * 10.5, width: 377, size: 8.7 }));
+  items.push(item('Sidebar row ' + n, { x: 432, y: 359 + n * 10.5, width: 100, size: 8.7 }));
+ }
+ for (let n = 0; n < 10; n++) {
+  items.push(item('Left row ' + n, { x: 38, y: 565 + n * 10.5, width: 241, size: 8.7 }));
+  items.push(item('Right row ' + n, { x: 297, y: 565 + n * 10.5, width: 241, size: 8.7 }));
+ }
+ const lines = layout(items, null, { ...viewport, width: 576 }).lines.map(line => line.text);
+ assert.deepEqual(Array.from(lines), ['Article title',
+  ...Array.from({ length: 16 }, (_, n) => 'Abstract row ' + n),
+  ...Array.from({ length: 16 }, (_, n) => 'Sidebar row ' + n),
+  ...Array.from({ length: 10 }, (_, n) => 'Left row ' + n),
+  ...Array.from({ length: 10 }, (_, n) => 'Right row ' + n)]);
+});
+
+test('keeps each column together across blank space when its width does not change', () => {
+ const items = [];
+ for (const y of [200, 218, 236, 320, 338, 356]) {
+  items.push(item('Left ' + y, { x: 60, y, width: 200 }));
+  items.push(item('Right ' + y, { x: 320, y, width: 210 }));
+ }
+ assert.equal(speak(items), [200, 218, 236, 320, 338, 356].map(y => 'Left ' + y)
+  .concat([200, 218, 236, 320, 338, 356].map(y => 'Right ' + y)).join('\n'));
+});
+
 test('keeps a tall chapter-outline sidebar out of the adjacent article flow', () => {
  const items = [
   item('Direct Practice Pitfalls', { x: 75, y: 90, width: 280, size: 20 }),
@@ -236,7 +291,7 @@ test('keeps a tall chapter-outline sidebar out of the adjacent article flow', ()
   item('The negative consequences may provide examples of these pitfalls.', { x: 75, y: 434, width: 280 })
  ];
  const text = speak(items);
- const spokenLines = text.split('\n');
+ const spokenLines = text.replace(/^# /gm, '').split('\n');
  const articleLines = items.filter(entry => entry.transform[4] < 395).map(entry => spokenLines.indexOf(entry.str));
  const outlineLines = items.filter(entry => entry.transform[4] >= 395).map(entry => spokenLines.indexOf(entry.str));
  assert.ok(Math.max(...articleLines) < Math.min(...outlineLines), 'article and chapter outline were interleaved:\n' + text);
@@ -280,6 +335,45 @@ test('does not treat smaller article columns beneath a large abstract as footnot
  for(let n=0;n<8;n++) {
   assert.match(text,new RegExp('Complete left body line '+n));
   assert.match(text,new RegExp('Complete right body line '+n));
+ }
+});
+
+test('excludes tightly spaced OCR footnotes starting high in one column despite font-size jitter', () => {
+ const items = [];
+ for (let n=0;n<5;n++) {
+  items.push(item('Left body paragraph line '+n+' stays readable.', {x:50,y:260+n*12,size:8,width:190}));
+  items.push(item('Right body paragraph line '+n+' stays readable.', {x:265,y:260+n*12,size:n%2?6:8,width:190}));
+ }
+ items.push(item('28 A numbered footnote begins here.', {x:272,y:331,size:6.8,width:180}));
+ for (let n=0;n<20;n++) items.push(item('Footnote continuation '+n+' has OCR font jitter.', {x:265,y:338+n*7,size:n%2?7.95:6.2,width:190}));
+ items.push(item('29 Another footnote belongs to the same block.', {x:272,y:478,size:6.6,width:180}));
+ items.push(item('Final footnote continuation.', {x:265,y:485,size:7.1,width:190}));
+ items.push(item('Left body continues beside the notes.', {x:50,y:485,size:8,width:190}));
+ const text=speak(items);
+ assert.doesNotMatch(text,/footnote/i);
+ for(let n=0;n<5;n++) {
+  assert.match(text,new RegExp('Left body paragraph line '+n));
+  assert.match(text,new RegExp('Right body paragraph line '+n));
+ }
+ assert.match(text,/Left body continues/);
+});
+
+test('keeps numbered body lists at the surrounding paragraph line spacing', () => {
+ const items=[...body(),item('A paragraph introduces this ordinary list.',{y:450})];
+ for(let n=0;n<4;n++) items.push(item((n+1)+'. Body list entry remains part of the document.',{y:480+n*18}));
+ const text=speak(items);
+ for(let n=1;n<=4;n++) assert.ok(text.includes(n+'. Body list entry'));
+});
+
+test('excludes short OCR notes and notes with a modest separator gap', () => {
+ for(const [pitch,gap,width,nextPitch] of [[10.3,30.5,58,9.1],[12.3,17.3,190,7.9]]) {
+  const items=Array.from({length:5},(_,n)=>item('Body paragraph line '+n+' remains intact.',{x:60,y:500+n*pitch,size:7.95,width:190}));
+  const y=500+4*pitch+gap;
+  items.push(item('24 Loc. cit.',{x:67,y,size:6.8,width}));
+  items.push(item('25 Ibid.',{x:67,y:y+nextPitch,size:6.5,width}));
+  const text=speak(items);
+  assert.doesNotMatch(text,/Loc\.|Ibid/);
+  assert.match(text,/Body paragraph line 4/);
  }
 });
 
@@ -412,6 +506,22 @@ function pdfSurface(items) {
  return { doc, selection };
 }
 
+test('reads PDF footnotes only when explicitly selected', () => {
+ const items=[...body(),item('1. An explanatory footnote.',{y:690,size:9}),item('Its continuation remains selectable.',{y:704,size:9})];
+ const {doc}=pdfSurface(items);
+ const selection={rangeCount:1,getRangeAt:()=>({intersectsNode:node=>items.indexOf(node.item)>=3})};
+ assert.doesNotMatch(speak(items),/footnote|selectable/);
+ assert.equal(api.normalizeForSpeech(api.selectionSpeechText(doc,selection)), '1. An explanatory footnote. Its continuation remains selectable.');
+});
+
+test('reads an explicitly selected semantic footnote while excluding document playback tokens', () => {
+ const node={nodeValue:'Selected footnote text.',parentElement:{closest:selector=>selector.includes('doc-footnote')?{}:null}};
+ const doc={body:{},querySelector:()=>null,createTreeWalker:()=>{let done=false;return {nextNode:()=>done?null:(done=true,node)};}};
+ const selection={rangeCount:1,getRangeAt:()=>({intersectsNode:()=>true})};
+ assert.equal(api.selectionSpeechText(doc,selection),'Selected footnote text.');
+ assert.equal(api.surfaceTokensForDoc(doc).length,0);
+});
+
 test('reads a sentence-ending word with a separate PDF hyphen as one word in document, selection and highlighting', () => {
  const items = [
   item('The inter', { width: 54, hasEOL: false }),
@@ -453,4 +563,69 @@ test('retains every OCR body fragment on the six reported article pages, in colu
   const rightWords=columnItems.filter(i=>i.transform[4]>=260).map(i=>text.indexOf(i.str));
   assert.ok(Math.max(...leftWords)<Math.min(...rightWords),'column jump on article page '+(index+1));
  }
+});
+
+
+test('PDF extraction preserves heading boundaries and joins multiline titles', () => {
+ const text = speak([
+  item('A section heading', { y: 200, size: 14, width: 200 }),
+  item('continued on a second line', { y: 219, size: 14, width: 220 }),
+  item('The body paragraph starts after the complete title.', { y: 260, size: 12 }),
+  item('A second body line continues the paragraph.', { y: 278, size: 12 }),
+  item('Questions', { y: 310, size: 11, width: 70 }),
+  item('1. What happens next in this family?', { y: 330, size: 11 })
+ ]);
+ assert.match(text, /^# A section heading continued on a second line\n/);
+ assert.match(text, /\n# Questions\n1\./);
+ assert.doesNotMatch(text, /# The body|# A second body|# 1\./);
+});
+
+test('OCR font-size variation within a paragraph does not create heading pauses', () => {
+ const text = speak([
+  item('The Article Title', { y: 180, size: 18, width: 250 }),
+  item('Values may be conceived along three', { y: 300, size: 6, width: 175 }),
+  item('basic dimensions which would account for', { y: 312, size: 9.4, width: 191 }),
+  item('the major value orientations shared by so', { y: 324, size: 9.5, width: 190 }),
+  item('cial workers and related to all aspects of', { y: 336, size: 8, width: 191 }),
+  item('their professional practice and education.', { y: 348, size: 8, width: 191 }),
+  item('Another paragraph continues with ordinary', { y: 360, size: 6, width: 180 }),
+  item('body text at the same regular line spacing.', { y: 372, size: 8, width: 191 }),
+  item('THE NEXT SECTION', { y: 402, size: 8, width: 140 }),
+  item('A body paragraph follows the section.', { y: 425, size: 8, width: 191 })
+ ]);
+ assert.deepEqual(text.split('\n').filter(line => line.startsWith('# ')),
+  ['# The Article Title', '# THE NEXT SECTION']);
+});
+
+
+test('a large drop cap does not turn the opening paragraph into a heading', () => {
+ const text = speak([
+  item('T', { x: 60, y: 250, size: 24, width: 16 }),
+  item('he opening paragraph continues with ordinary body text', { x: 80, y: 250, size: 10 }),
+  item('and finishes on the following printed line.', { x: 60, y: 268, size: 10 }),
+  item('The next full body line keeps the same font size.', { x: 60, y: 286, size: 10 })
+ ]);
+ assert.doesNotMatch(text, /^# /m);
+});
+
+
+test('repairs OCR omission of line-end hyphens in classification and orientation', () => {
+ const items = [
+  item('The classifica', { x: 100, y: 200, width: 260, size: 10 }),
+  item('tion describes the kind of orienta', { x: 100, y: 220, width: 260, size: 10 }),
+  item('tion a social worker should have.', { x: 100, y: 240, width: 260, size: 10 })
+ ];
+ const { doc, selection } = pdfSurface(items);
+ const expected = 'The classification describes the kind of orientation a social worker should have.';
+ assert.equal(api.normalizeForSpeech(speak(items)), expected);
+ assert.equal(api.normalizeForSpeech(api.selectionSpeechText(doc, selection)), expected);
+ const tokens = api.surfaceTokensForDoc(doc);
+ for (const word of ['classification', 'orientation']) {
+  const token = tokens.find(token => token.norm === word);
+  assert.ok(token, 'highlight matches ' + word);
+  assert.equal(token.segments.length, 2);
+ }
+ assert.equal(api.normalizeForSpeech('Other classifica\n\ntions remain.\nWell-being and client-centered care.'),
+  'Other classifications remain. Well-being and client-centered care.');
+ assert.equal(api.normalizeForSpeech('A new orienta\ntional approach follows.'), 'A new orienta tional approach follows.');
 });

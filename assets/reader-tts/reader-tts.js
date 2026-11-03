@@ -75,14 +75,58 @@
 	var DEFAULT_HIGHLIGHT_STYLE = HIGHLIGHT_STYLES.indexOf(CFG.highlightStyle) !== -1
 		? CFG.highlightStyle
 		: 'ball';
-	var pronunciations = Object.create(null);
-	var pronunciationConfig = CFG.pronunciations || { meso: 'mˈɛzO' };
-	Object.keys(pronunciationConfig).forEach(function (word) {
-		var phonemes = pronunciationConfig[word];
-		if (typeof phonemes === 'string' && phonemes.trim() && !/[\/()[\]\r\n]/u.test(phonemes)) {
-			pronunciations[word.toLowerCase()] = phonemes.trim();
+	var PRONUNCIATIONS_ENDPOINT = CFG.pronunciationsEndpoint || null;
+	var pronunciationRefresh = null;
+
+	function normalizePronunciationDictionary(raw) {
+		if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+		var words = Object.keys(raw);
+		if (words.length > 500) return null;
+		var normalized = Object.create(null);
+		for (var i = 0; i < words.length; i++) {
+			var word = words[i].trim().toLowerCase();
+			var phonemes = raw[words[i]];
+			if (!word || !/^[\p{L}\p{M}\p{N}_]+$/u.test(word)
+				|| Object.prototype.hasOwnProperty.call(normalized, word)
+				|| typeof phonemes !== 'string') return null;
+			phonemes = phonemes.trim();
+			if (!phonemes || phonemes.length > 64 || /[\/()[\]\r\n]/u.test(phonemes)) return null;
+			normalized[word] = phonemes;
 		}
-	});
+		return normalized;
+	}
+
+	var pronunciationConfig = Object.prototype.hasOwnProperty.call(CFG, 'pronunciations')
+		? CFG.pronunciations
+		: { meso: 'mˈɛzO' };
+	var pronunciations = normalizePronunciationDictionary(pronunciationConfig)
+		|| Object.create(null);
+
+	/** Fetch before synthesis so Settings changes apply to the next clip. A bad
+	 * response leaves the last valid dictionary in place. Concurrent prefetches
+	 * share one request. */
+	function refreshPronunciations() {
+		if (!PRONUNCIATIONS_ENDPOINT) return Promise.resolve();
+		if (pronunciationRefresh) return pronunciationRefresh;
+		pronunciationRefresh = fetch(PRONUNCIATIONS_ENDPOINT, {
+			credentials: 'same-origin',
+			cache: 'no-store'
+		}).then(function (response) {
+			if (!response.ok) throw new Error('Pronunciation registry HTTP ' + response.status);
+			return response.json();
+		}).then(function (payload) {
+			var next = payload && payload.ok === true
+				? normalizePronunciationDictionary(payload.pronunciations)
+				: null;
+			if (!next) throw new Error('Invalid pronunciation registry');
+			pronunciations = next;
+		}).catch(function () {
+			// Offline registry: keep the last valid dictionary and continue reading.
+		}).then(function () {
+			pronunciationRefresh = null;
+		});
+		return pronunciationRefresh;
+	}
 
 	/**
 	 * Characters per synthesized part.
@@ -131,6 +175,19 @@
 		return chunks;
 	}
 
+	function speechParts(text) {
+		var parts = [];
+		String(text || '').replace(/\r\n?/g, '\n')
+			.split(/(^[ \t]{0,3}#{1,6}[ \t]+.+$)/gm).forEach(function (section) {
+				var heading = /^[ \t]{0,3}#{1,6}[ \t]+/.test(section);
+				var chunks = splitTextForSpeech(normalizeForSpeech(section), CHUNK_MAX_CHARS);
+				chunks.forEach(function (chunk, index) {
+					parts.push(createPart(chunk, 0, heading && index === chunks.length - 1 ? 1000 : 0, heading && index === 0 ? 2000 : 0));
+				});
+			});
+		return parts;
+	}
+
 	/**
 	 * Clean up text pulled out of a PDF text layer or the full-text index.
 	 *
@@ -150,7 +207,7 @@
 			if (!/[.!?…:;]$/.test(heading)) heading += '.';
 			return '\n' + heading + '\n';
 		});
-		return cleanCitationsForSpeech(pruneBoilerplateLines(lines))
+		return cleanCitationsForSpeech(pruneBoilerplateLines(lines)
 			// PDF/OCR can separate the final hyphen from its word with spaces.
 			// Require a line break for visible hyphens; keep within-line compounds.
 			// Look ahead at the next letter so successive wraps (re-\na-\nlignment)
@@ -158,6 +215,9 @@
 			.replace(/([\p{L}\p{M}])[^\S\n]*[-\u00AD\u2010][^\S\n]*\n\s*(?=\p{L})/gu, '$1')
 			// Discretionary soft hyphens are formatting even without a line break.
 			.replace(/\u00AD/g, '')
+			// ponytail: OCR can omit a printed hyphen before the nonword
+			// fragments tion/tions; ambiguous splits need OCR/layout evidence.
+			.replace(/([\p{L}\p{M}])[^\S\n]*\n\s*(tions?)(?![\p{L}\p{M}\p{N}_])/gu, '$1$2'))
 			// Collapse runs of blank lines to exactly one paragraph break.
 			.replace(/\n{2,}/g, '\n\n')
 			// A lone newline is a line wrap, not a sentence end.
@@ -167,14 +227,22 @@
 	}
 
 	function cleanCitationsForSpeech(text) {
+		// Match author-year forms with or without commas, including Unicode
+		// surnames, two authors, organizations and lists of references/years.
+		// Calendar dates and bare years are not citation markers.
+		var name = String.raw`(?!(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?|Spring|Summer|Autumn|Fall|Winter)(?![\p{L}\p{M}]))(?:(?:van|von|de|del|da|dos|du|di|la|le)\s*)?[\p{Lu}\p{Lt}][\p{L}\p{M}'\u2019-]+`;
+		var organization = '(?:' + name + String.raw`\s+)+(?:Association|Organization|Organisation)`;
+		var authors = '(?:' + organization + '|' + name + String.raw`(?:\s+(?:&|and)\s+` + name + String.raw`|\s+et\s+al\.?)?)`;
+		var years = String.raw`(?:18|19|20)\d{2}[a-z]?(?:\s*,\s*(?:18|19|20)\d{2}[a-z]?)*`;
+		var reference = authors
+			+ String.raw`(?:\s*,\s*|\s+)` + years
+			+ String.raw`(?:,\s*p{1,2}\.\s*\d+(?:[–-]\d+)?)?`;
 		return String(text || '')
 			// Numeric citations: [4], [12, 13], [2-5].
 			.replace(/\[\s*\d{1,4}(?:\s*(?:,|;|-|–|—)\s*\d{1,4})*\s*\]/g, ' citation ')
-			// Require a recognizable author-year shape, not merely a year:
-			// dates and ordinary explanations in parentheses are spoken.
-			.replace(/\((?:(?!(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\b)[A-Z][A-Za-z'\u2019-]+(?:\s+(?:&|and)\s+[A-Z][A-Za-z'\u2019-]+|\s+et\s+al\.)?,\s*(?:18|19|20)\d{2}[a-z]?(?:,\s*p{1,2}\.\s*\d+(?:[–-]\d+)?)?)(?:;\s*(?!(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\b)[A-Z][A-Za-z'\u2019-]+(?:\s+(?:&|and)\s+[A-Z][A-Za-z'\u2019-]+|\s+et\s+al\.)?,\s*(?:18|19|20)\d{2}[a-z]?)*\)/g, ' citation ')
-			// Common inline forms like "Smith et al. (2020)".
-			.replace(/\b(?!(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:t(?:ember)?)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\b)[A-Z][A-Za-z'\u2019-]+(?:\s+et\s+al\.)?\s+\((?:18|19|20)\d{2}[a-z]?\)/g, 'citation');
+			.replace(new RegExp(String.raw`\(\s*` + reference + String.raw`(?:\s*;\s*` + reference + String.raw`)*\s*\)`, 'gu'), ' citation ')
+			// Match the full author list, rather than just its final surname.
+			.replace(new RegExp(String.raw`(^|[^\p{L}\p{M}'\u2019-])` + authors + String.raw`\s*\(\s*` + years + String.raw`\s*\)`, 'gu'), '$1citation');
 	}
 
 	function pruneBoilerplateLines(text) {
@@ -488,6 +556,31 @@
 		});
 	}
 
+	// Join native token fragments only when they match the source exactly.
+	function captionTimeline(text, timestamps) {
+		if (!Array.isArray(timestamps) || !timestamps.length) return null;
+		var tokens = timestamps.filter(function (token) { return token && normalizedMatchWord(token.word); });
+		var words = text.match(/\S+/g) || [];
+		var timeline = [], cursor = 0, lastStart = -1;
+		for (var i = 0; i < words.length; i++) {
+			var word = normalizedMatchWord(words[i]);
+			if (!word) continue;
+			var joined = '', start = null, end = 0;
+			while (joined !== word) {
+				var token = tokens[cursor++];
+				if (!token || !Number.isFinite(token.start_time) || !Number.isFinite(token.end_time)
+					|| token.start_time < 0 || token.start_time < lastStart || token.end_time < token.start_time) return null;
+				joined += normalizedMatchWord(token.word);
+				if (!word.startsWith(joined)) return null;
+				if (start === null) start = token.start_time;
+				end = Math.max(end, token.end_time);
+				lastStart = token.start_time;
+			}
+			timeline.push([i, Math.round(start * 1000), Math.max(Math.round(start * 1000) + 1, Math.round(end * 1000)), 1]);
+		}
+		return cursor === tokens.length && timeline.length ? timeline : null;
+	}
+
 	/**
 	 * Synthesize one part. Resolves to an object URL for a fully buffered,
 	 * seekable audio Blob.
@@ -498,22 +591,38 @@
 	 * takes effect on the currently playing buffer instantly.
 	 */
 	function synthesize(text, signal) {
-		return fetch(ENDPOINT + '/v1/audio/speech', {
-			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
-			body: JSON.stringify({
-				model: 'kokoro',
-				voice: voice,
-				input: applyPronunciations(text),
-				response_format: FORMAT,
-				speed: 1
-			}),
-			// The endpoint may sit behind an nginx auth_request gate that reads
-			// the deployment's session cookie. Same-origin is fetch's default,
-			// but state it: without the cookie such a gate answers 401 and no
-			// audio is ever produced.
-			credentials: 'same-origin',
-			signal: signal
+		var captioned = !!ALIGNMENT_ENDPOINT;
+		function requestAudio() {
+			return fetch(ENDPOINT + (captioned ? '/dev/captioned_speech' : '/v1/audio/speech'), {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					model: 'kokoro',
+					voice: voice,
+					input: applyPronunciations(text),
+					response_format: FORMAT,
+					speed: 1,
+					stream: false,
+					// Preserve source tokens (e.g. 25) for native timestamp matching.
+					normalization_options: captioned ? { normalize: false } : undefined
+				}),
+				// The endpoint may sit behind an nginx auth_request gate that reads
+				// the deployment's session cookie. Same-origin is fetch's default,
+				// but state it: without the cookie such a gate answers 401 and no
+				// audio is ever produced.
+				credentials: 'same-origin',
+				signal: signal
+			});
+		}
+		var response = PRONUNCIATIONS_ENDPOINT
+			? refreshPronunciations().then(requestAudio)
+			: requestAudio();
+		return response.then(function (response) {
+			if (captioned && (response.status === 404 || response.status === 405)) {
+				captioned = false;
+				return requestAudio();
+			}
+			return response;
 		}).then(function (response) {
 			if (!response.ok) {
 				return response.text().catch(function () { return ''; })
@@ -531,6 +640,15 @@
 						);
 					});
 			}
+			if (captioned) return response.json().then(function (body) {
+				if (!body || typeof body.audio !== 'string' || !body.audio
+					|| typeof body.audio_format !== 'string' || !/^audio\/[a-z0-9.+-]+$/i.test(body.audio_format)) {
+					throw new Error('Invalid captioned audio response');
+				}
+				var bytes = Uint8Array.from(atob(body.audio), function (c) { return c.charCodeAt(0); });
+				return { blob: new Blob([bytes], { type: body.audio_format }), contentType: body.audio_format,
+					timeline: captionTimeline(text, body.timestamps) };
+			});
 			return response.blob().then(function (blob) {
 				return { blob: blob, contentType: response.headers.get('content-type') || blob.type || '' };
 			});
@@ -538,6 +656,7 @@
 			return {
 				blob: result.blob,
 				contentType: result.contentType,
+				timeline: result.timeline,
 				url: URL.createObjectURL(result.blob)
 			};
 		});
@@ -559,6 +678,7 @@
 	var voice = loadVoice();
 	var highlightStyle = loadHighlightStyle();
 	var surfacePaint = null;
+	var surfaceRepaintPending = false;
 	var SURFACE_STYLE_ID = 'ztts-surface-style';
 	var SURFACE_STYLE_TEXT = [
 		'.ztts-surface-layer{position:fixed;inset:0;z-index:2147483000;pointer-events:none;overflow:hidden;}',
@@ -590,7 +710,18 @@
 		audio.addEventListener('ended', function () {
 			if (!run || run.loading || !audio.src || audio.src !== run.parts[run.index].url) return;
 			run.pendingSeek = null;
-			playPart(run.index + 1, true);
+			if (run.parts[run.index].pauseAfter && run.index + 1 < run.parts.length) {
+				run.headingPause = { autoplay: true, timer: null, index: run.index + 1, delay: run.parts[run.index].pauseAfter };
+				scheduleHeadingPause();
+			}
+			else playPart(run.index + 1, true);
+		});
+		audio.addEventListener('seeking', function () {
+			if (!run || !run.headingPause) return;
+			var autoplay = run.headingPause.autoplay;
+			clearTimeout(run.headingPause.timer);
+			run.headingPause = null;
+			if (autoplay) audio.play().catch(function () { setPhase('paused'); });
 		});
 		audio.addEventListener('loadedmetadata', function () {
 			// Re-pin after the load algorithm has run, so the rate holds even
@@ -606,6 +737,18 @@
 			setError('Audio playback failed');
 		});
 		return audio;
+	}
+
+	// Keep the heading gap in wall-clock time: playbackRate must not shorten it.
+	function scheduleHeadingPause() {
+		var theRun = run;
+		var pause = theRun.headingPause;
+		pause.timer = setTimeout(function () {
+			if (run === theRun && theRun.headingPause === pause && pause.autoplay) {
+				playPart(pause.index, true, pause.index === theRun.index);
+			}
+		}, pause.delay);
+		setPhase('playing');
 	}
 
 	/**
@@ -702,6 +845,7 @@
 			cancelSurfaceScroll();
 			if (completed) clearReadProgress(run);
 			else saveReadProgress(true);
+			if (run.headingPause) clearTimeout(run.headingPause.timer);
 			run.controller.abort();
 			run.parts.forEach(releasePart);
 		}
@@ -736,6 +880,10 @@
 				part.url = result.url;
 				part.blob = result.blob;
 				part.contentType = result.contentType;
+				if (result.timeline) {
+					part.timeline = result.timeline.map(function (entry) { return [entry[0] + part.startWord, entry[1], entry[2], entry[3]]; });
+					part.blob = null;
+				}
 				alignPart(theRun, index, result.blob);
 				return result.url;
 			}, function (err) {
@@ -775,8 +923,10 @@
 	 * Load part `index` and optionally start it. An out-of-range index is the
 	 * exit edge — "next" on the final part ends the job.
 	 */
-	function playPart(index, autoplay) {
+	function playPart(index, autoplay, skipHeadingPause) {
 		if (!run) return;
+		if (run.headingPause) clearTimeout(run.headingPause.timer);
+		run.headingPause = null;
 		if (index < 0 || index >= run.parts.length) {
 			stopRun(true);
 			return;
@@ -801,7 +951,7 @@
 		// A clip generated from a clicked word is only for that visit. After
 		// leaving it, later sequential playback must read the complete part.
 		if (previousIndex !== index && previous.startWord) {
-			theRun.parts[previousIndex] = createPart(previous.text);
+			theRun.parts[previousIndex] = createPart(previous.text, 0, previous.pauseAfter, previous.pauseBefore);
 			releasePart(previous);
 		}
 		setPhase('loading');
@@ -819,6 +969,14 @@
 			if (!autoplay) {
 				theRun.loading = false;
 				setPhase('paused');
+				return;
+			}
+			if (!skipHeadingPause && theRun.parts[index].pauseBefore) {
+				theRun.headingPause = {
+					autoplay: true, timer: null, index: index, delay: theRun.parts[index].pauseBefore
+				};
+				scheduleHeadingPause();
+				prefetchNext();
 				return;
 			}
 			var started = a.play();
@@ -853,11 +1011,13 @@
 		});
 	}
 
-	function createPart(text, startWord) {
+	function createPart(text, startWord, pauseAfter, pauseBefore) {
 		var words = text.match(/\S+\s*/g) || [];
 		startWord = Math.min(Math.max(0, startWord || 0), Math.max(0, words.length - 1));
 		return {
 			text: text,
+			pauseAfter: pauseAfter || 0,
+			pauseBefore: pauseBefore || 0,
 			// Keep the complete part for matching and backwards jumps. If no
 			// timings exist, synthesize exactly from the requested word.
 			startWord: startWord,
@@ -882,10 +1042,10 @@
 		options = options || {};
 		var normalized = normalizeForSpeech(text);
 		var key = source + ':' + normalized;
-		var chunks = splitTextForSpeech(normalized, CHUNK_MAX_CHARS);
+		var parts = speechParts(text);
 		var initial = options.surfaceHit && runPositionForSurfaceToken(
 			options.surfaceHit.tokens, options.surfaceHit.tokenIndex,
-			{ parts: chunks.map(function (chunk) { return createPart(chunk); }) }
+			{ parts: parts }
 		);
 		if (options.surfaceHit && !initial) return false;
 		if (run && run.key === key && !initial) {
@@ -893,13 +1053,13 @@
 			return;
 		}
 		stopRun();
-		if (!chunks.length) {
+		if (!parts.length) {
 			showBar();
 			setError('Nothing to read');
 			return;
 		}
 		var attachment = options.attachmentKey || null;
-		var progress = initial ? null : loadReadProgress(attachment, source, normalized, chunks.length);
+		var progress = initial ? null : loadReadProgress(attachment, source, normalized, parts.length);
 		run = {
 			key: key,
 			source: source,
@@ -917,9 +1077,11 @@
 			// Index of a part whose synthesis failed, so Play can retry it.
 			failed: null,
 			controller: new AbortController(),
-			parts: chunks.map(function (t, index) {
-				if (initial && initial.partIndex === index) return createPart(t, initial.wordIndex);
-				return createPart(t, progress && progress.index === index ? progress.startWord : 0);
+			headingPause: null,
+			parts: parts.map(function (part, index) {
+				var start = initial && initial.partIndex === index ? initial.wordIndex
+					: progress && progress.index === index ? progress.startWord : 0;
+				return start ? createPart(part.text, start, part.pauseAfter, part.pauseBefore) : part;
 			})
 		};
 		renderSurfaceFollow();
@@ -936,6 +1098,16 @@
 
 	function togglePlay() {
 		if (!run) return;
+		if (run.headingPause) {
+			var pause = run.headingPause;
+			pause.autoplay = !pause.autoplay;
+			if (pause.autoplay) scheduleHeadingPause();
+			else {
+				clearTimeout(pause.timer);
+				setPhase('paused');
+			}
+			return;
+		}
 		// A part whose synthesis failed left nothing loaded. Play then means
 		// "try that part again" — the useful action after a transient Kokoro
 		// error — rather than doing nothing, or replaying a neighbouring part.
@@ -974,12 +1146,12 @@
 			// `target` is negative: that many seconds before the previous
 			// part's end. Its duration is not known until it loads.
 			run.pendingSeek = { fromEnd: true, seconds: -target };
-			playPart(run.index - 1, !audio.paused);
+			playPart(run.index - 1, run.headingPause ? run.headingPause.autoplay : !audio.paused);
 			return;
 		}
 		if (duration > 0 && target > duration) {
 			run.pendingSeek = { fromEnd: false, seconds: target - duration };
-			playPart(run.index + 1, !audio.paused);
+			playPart(run.index + 1, run.headingPause ? run.headingPause.autoplay : !audio.paused);
 			return;
 		}
 		audio.currentTime = duration > 0 ? Math.min(target, duration) : target;
@@ -1014,13 +1186,13 @@
 			return;
 		}
 		run.pendingSeek = null;
-		playPart(run.index - 1, !audio.paused);
+		playPart(run.index - 1, run.headingPause ? run.headingPause.autoplay : !audio.paused);
 	}
 
 	function nextPart() {
 		if (!run) return;
 		run.pendingSeek = null;
-		playPart(run.index + 1, !(audio && audio.paused));
+		playPart(run.index + 1, run.headingPause ? run.headingPause.autoplay : !(audio && audio.paused));
 	}
 
 	/**
@@ -1040,13 +1212,13 @@
 		if (ui.voice) ui.voice.value = voice;
 		if (!run) return;
 		var at = audio && isFinite(audio.currentTime) ? audio.currentTime : 0;
-		var wasPlaying = !!(audio && !audio.paused);
+		var wasPlaying = run.headingPause ? run.headingPause.autoplay : !!(audio && !audio.paused);
 		var index = run.index;
 		run.controller.abort();
 		run.controller = new AbortController();
 		run.parts.forEach(releasePart);
 		run.parts = run.parts.map(function (part) {
-			return createPart(part.text, part.startWord);
+			return createPart(part.text, part.startWord, part.pauseAfter, part.pauseBefore);
 		});
 		run.failed = null;
 		run.pendingSeek = { fromEnd: false, seconds: at };
@@ -1463,15 +1635,17 @@
 		return part.surfaceWords;
 	}
 
-	function acceptsSurfaceTextNode(node, includeWhitespace) {
+	function acceptsSurfaceTextNode(node, includeWhitespace, includeNotes) {
 		if (!node || !node.nodeValue || (!includeWhitespace && !node.nodeValue.trim())) return false;
 		var el = node.parentElement;
 		if (!el) return false;
-		if (el.closest([
-			'script', 'style', 'noscript', 'template', 'svg',
+		if (!includeNotes && el.closest([
 			'header', 'footer', 'aside', '[role="doc-footnote"]', '[role="doc-endnote"]',
 			'[role="doc-noteref"]', '[role="doc-pageheader"]', '[role="doc-pagefooter"]',
-			'[epub\\:type~="footnote"]', '[epub\\:type~="endnote"]', '[epub\\:type~="noteref"]',
+			'[epub\\:type~="footnote"]', '[epub\\:type~="endnote"]', '[epub\\:type~="noteref"]'
+		].join(', '))) return false;
+		if (el.closest([
+			'script', 'style', 'noscript', 'template', 'svg',
 			'.ztts-bar', '.ztts-selection',
 			'#toolbarContainer', '#toolbarViewer', '#secondaryToolbar',
 			'#findbar', '#loadingBar', '#errorWrapper',
@@ -1521,6 +1695,7 @@
 
 	function surfaceTokensForDoc(doc, root, includeUnmounted) {
 		var tokens = [];
+		var includeNotes = run && run.source === 'selection';
 		root = root || surfaceRootForDoc(doc);
 		if (!root) return tokens;
 		var filter = doc.defaultView && doc.defaultView.NodeFilter;
@@ -1529,7 +1704,7 @@
 			filter ? filter.SHOW_TEXT : 4,
 			{
 				acceptNode: function (node) {
-					return acceptsSurfaceTextNode(node)
+					return acceptsSurfaceTextNode(node, false, includeNotes)
 						? (filter ? filter.FILTER_ACCEPT : 1)
 						: (filter ? filter.FILTER_REJECT : 2);
 				}
@@ -1577,7 +1752,7 @@
 		pages.forEach(function (page) {
 			page.lines = pdfReadingOrder(page.fragments, 0, page.width);
 			if (isPdfMetadataPage(page)) return;
-			pdfBodyLines(page).forEach(function (line) {
+			(includeNotes ? page.lines : pdfBodyLines(page)).forEach(function (line) {
 				line.fragments.forEach(function (fragment) {
 					fragment.token.speechLine = line;
 					ordered.push(fragment.token);
@@ -1597,6 +1772,10 @@
 			else if (previous && previous.speechLine !== token.speechLine
 				&& /[\p{L}\p{M}][-\u00AD\u2010]$/u.test(previous.text) && /^\p{L}/u.test(token.text)) {
 				joinedText = previous.text.slice(0, -1) + token.text;
+			}
+			else if (previous && previous.speechLine !== token.speechLine
+				&& /[\p{L}\p{M}]$/u.test(previous.text) && /^tions?$/.test(token.norm)) {
+				joinedText = previous.text + token.text;
 			}
 			if (joinedText !== null) {
 				previous.segments = (previous.segments || [Object.assign({}, previous)]).concat(token);
@@ -1734,19 +1913,19 @@
 		if (!part || wordIndex < 0 || wordIndex >= partMatchWords(part).length) return false;
 		var at = part.url ? timeForWord(part, wordIndex) : null;
 		if (at === null && part.url && wordIndex === part.startWord) at = 0;
-		if (partIndex === run.index && !run.loading && audio && audio.src === part.url && at !== null) {
+		if (partIndex === run.index && !run.loading && !run.headingPause && audio && audio.src === part.url && at !== null) {
 			run.pendingSeek = null;
 			audio.currentTime = Math.max(0, at - 0.08);
 			saveReadProgress(true);
 			paintHighlight(true);
 			return true;
 		}
-		var autoplay = run.loading ? run.autoplay : !!(audio && !audio.paused);
+		var autoplay = run.headingPause ? run.headingPause.autoplay : run.loading ? run.autoplay : !!(audio && !audio.paused);
 		saveReadProgress(true);
 		if (at === null) {
 			// A new part object also invalidates synthesis/alignment already
 			// in flight for this part. Late results cannot replace this jump.
-			run.parts[partIndex] = createPart(part.text, wordIndex);
+			run.parts[partIndex] = createPart(part.text, wordIndex, part.pauseAfter, part.pauseBefore);
 			at = 0;
 		}
 		run.pendingSeek = { fromEnd: false, seconds: Math.max(0, at - 0.08) };
@@ -1755,12 +1934,12 @@
 		return true;
 	}
 
-	function seekToSurfacePoint(doc, clientX, clientY, event) {
-		if (!run) return false;
+	function seekToSurfacePoint(doc, clientX, clientY, event, startIfIdle) {
+		if (!run && !startIfIdle) return false;
 		var hit = tokenAtPoint(doc, clientX, clientY);
 		if (!hit) return false;
-		var position = runPositionForSurfaceToken(hit.tokens, hit.tokenIndex);
-		if (!position && run.source !== 'selection') return false;
+		var position = run && runPositionForSurfaceToken(hit.tokens, hit.tokenIndex);
+		if (!position && run && run.source !== 'selection') return false;
 		if (event) {
 			event.preventDefault();
 			event.stopPropagation();
@@ -1784,7 +1963,7 @@
 	function seekToSurfaceClick(doc, event) {
 		if (!(event.metaKey || event.ctrlKey)) return false;
 		if (event.button !== undefined && event.button !== 0) return false;
-		return seekToSurfacePoint(doc, event.clientX, event.clientY, event);
+		return seekToSurfacePoint(doc, event.clientX, event.clientY, event, true);
 	}
 
 	function selectionTextForDoc(doc) {
@@ -2171,7 +2350,19 @@
 			clearSurfaceHighlight();
 			return false;
 		}
-		var target = locateSurfaceWord(part, active);
+		// Scrolling changes geometry, not the word's text anchor. Re-scanning
+		// every rendered word on each scroll frame stalls long documents and
+		// can choose a different occurrence as PDF text layers are recycled.
+		var target = part.surfaceTarget;
+		var token = target && target.tokens[target.tokenIndex];
+		if (!target || target.activeWord !== active || !token
+			|| !(token.segments || [token]).every(function (segment) {
+				return segment.node.isConnected
+					&& segment.node.nodeValue.slice(segment.start, segment.end) === segment.text;
+			})) {
+			target = locateSurfaceWord(part, active);
+			part.surfaceTarget = target;
+		}
 		if (!target) {
 			if (follow) followUnrenderedPdfWord(part, active);
 			clearSurfaceHighlight();
@@ -2207,6 +2398,21 @@
 		}
 		if (ui.bar) ui.bar.classList.add('ztts-surface-active');
 		return true;
+	}
+
+	function scheduleSurfaceRepaint() {
+		if (!ALIGNMENT_ENDPOINT || surfaceRepaintPending) return;
+		surfaceRepaintPending = true;
+		window.requestAnimationFrame(function () {
+			surfaceRepaintPending = false;
+			if (!run || !audio) return;
+			var part = run.parts[run.index];
+			if (!part || !part.readAlong || audio.src !== part.url) return;
+			// Leave playback updates to the audio clock. A scroll only needs
+			// fresh rectangles for the highlight, and must never navigate.
+			var active = activeWordForPart(part, audio.currentTime);
+			paintSurfaceHighlight(part, active, sentenceRangeForWord(part.readAlong.words, active), false);
+		});
 	}
 
 	function paintHighlight(force, follow) {
@@ -2497,6 +2703,22 @@
 		var rows = pdfTextRows(fragments);
 		var gutter = pdfColumnGutter(rows, left, right);
 		if (gutter === null) gutter = pdfSeparatedColumnGutter(rows, left, right);
+		// A large blank band can separate layouts with different column widths
+		// (for example, a wide abstract/sidebar above equal article columns).
+		var bands = [[]];
+		rows.forEach(function (row, index) {
+			var previous = rows[index - 1];
+			if (previous && row.y - previous.y > Math.max(previous.size, row.size) * 3) bands.push([]);
+			Array.prototype.push.apply(bands[bands.length - 1], row.fragments);
+		});
+		if (bands.length > 1 && bands.some(function (band) {
+			var bandRows = pdfTextRows(band);
+			var bandGutter = pdfColumnGutter(bandRows, left, right);
+			if (bandGutter === null) bandGutter = pdfSeparatedColumnGutter(bandRows, left, right);
+			return bandGutter !== null && (gutter === null || Math.abs(bandGutter - gutter) > (right - left) * 0.025);
+		})) {
+			return bands.reduce(function (lines, band) { return lines.concat(pdfReadingOrder(band, left, right)); }, []);
+		}
 		if (gutter === null) {
 			if (rows.length >= 3) return rows.map(pdfMergeRow);
 			// Sparse rows cannot establish recurring columns. Keep widely
@@ -2577,7 +2799,50 @@
 		});
 		return pages.map(function (page, index) {
 			if (isPdfMetadataPage(page)) return '';
-			var text = pdfBodyLines(page, repeated).map(function (line) { return line.text.trim(); }).join('\n');
+			var lines = pdfBodyLines(page, repeated);
+			var bodySize = pdfBodyFontSize(page);
+			var out = [];
+			var previousHeading = null;
+			lines.forEach(function (line, i) {
+				var value = line.text.trim();
+				var previous = lines[i - 1];
+				var next = lines[i + 1];
+				var continuedHeading = previousHeading && line.y > previousHeading.y
+					&& line.y - previousHeading.y < line.size * 2.2
+					&& Math.abs(line.size - previousHeading.size) < line.size * 0.1;
+				// OCR size changes inside regularly spaced body lines are not headings.
+				var separated = !previous || line.y <= previous.y
+					|| line.y - previous.y > Math.max(line.size, bodySize) * 1.7;
+				var last = i;
+				while (last + 1 < lines.length && lines[last + 1].y > lines[last].y
+					&& lines[last + 1].y - lines[last].y < line.size * 2.2
+					&& Math.abs(lines[last + 1].size - line.size) < line.size * 0.1) last++;
+				var following = lines[last + 1];
+				var spaceAfter = following && following.y - lines[last].y > Math.max(line.size, bodySize) * 1.7;
+				// ponytail: untagged PDF headings use type size and isolated short
+				// lines; add structure-tree roles for ambiguous body-size headings.
+				var heading = bodySize && value.length < 160 && /\p{L}/u.test(value)
+					&& (separated || continuedHeading)
+					&& (continuedHeading || !/^\p{Ll}/u.test(value))
+					&& !/[.!;,:]$/.test(value) && !/^\d+[.)]?\s/.test(value)
+					&& !line.fragments.some(function (fragment) {
+						return /^[A-Z]$/.test(fragment.text.trim()) && fragment.size > bodySize * 1.8;
+					})
+					&& ((line.size >= bodySize * 1.15 && (spaceAfter || line.size >= bodySize * 1.5))
+						|| (value === value.toUpperCase() && next && next.y > line.y
+							&& line.y > page.height * 0.08 && line.y < page.height * 0.9)
+						|| (value.length < 80 && line.size < bodySize * 0.95
+							&& previous && next && line.y - previous.y > line.size * 1.7
+							&& next.y - line.y > bodySize * 1.5 && next.y - line.y < line.size * 3
+							&& line.right - line.left < (next.right - next.left) * 0.8
+							&& Math.abs(next.left - line.left) < bodySize * 3));
+				if (heading && continuedHeading) {
+					out[out.length - 1] += ' ' + value;
+				}
+				else out.push((heading ? '# ' : '') + value);
+				previousHeading = heading ? line : null;
+			});
+			var text = out.join('\n');
 			if (onPage) onPage(text, index + 1);
 			return text;
 		}).filter(Boolean).join('\n\n');
@@ -2593,7 +2858,7 @@
 		var notes = new Set();
 		var sorted = page.lines.slice().sort(function (a, b) { return a.y - b.y; });
 		sorted.forEach(function (line, index) {
-			if (line.y < page.height * 0.55) return;
+			if (line.y < page.height * 0.25) return;
 			// Use nearby text in the same column, not a page-wide font estimate:
 			// a large abstract must not make the entire article look like notes.
 			var above = sorted.slice(0, index).filter(function (other) {
@@ -2603,7 +2868,8 @@
 			}).slice(-5);
 			var previous = above[above.length - 1];
 			if (!previous) return;
-			if (notes.has(previous) && line.size <= previous.size * 1.12 && line.y - previous.y < previous.size * 2.5) {
+			if (notes.has(previous) && line.size <= previous.size * 1.35
+				&& line.y - previous.y < Math.max(line.size, previous.size) * 1.6) {
 				notes.add(line);
 				return;
 			}
@@ -2617,8 +2883,16 @@
 				return other.y > line.y + line.size * 0.6 && Math.abs(other.left - line.left) < localSize * 2;
 			});
 			var smallBlock = !below || below.size <= line.size * 1.15;
-			if (line.size < localSize * 0.85 && ((sameColumn && smallBlock && line.y - previous.y > localSize * 2)
-				|| /^\s*(?:\d{1,3}[.)]?|[*†‡])\s+\S/.test(line.text))) notes.add(line);
+			var marker = /^\s*(?:\d{1,3}[.)]?|[*†‡])\s+\S/.test(line.text);
+			// Dense numbered notes can start high in a column. OCR font sizes
+			// overlap body sizes, so also compare their baseline spacing.
+			var gaps = above.slice(1).map(function (other, i) { return other.y - above[i].y; })
+				.sort(function (a, b) { return a - b; });
+			var pitch = gaps[Math.floor(gaps.length / 2)];
+			var compactNote = marker && Math.abs(line.left - previous.left) < localSize * 2 && gaps.length >= 2 && below
+				&& line.y - previous.y > pitch * 1.3 && below.y - line.y < pitch * 0.9;
+			if (compactNote || (line.y > page.height * 0.55 && line.size < localSize * 0.85
+				&& ((sameColumn && smallBlock && line.y - previous.y > localSize * 2) || marker))) notes.add(line);
 		});
 		return notes;
 	}
@@ -2668,14 +2942,30 @@
 				pdfSurfaceCache.set(pdf, tokens);
 				return text;
 			}
-			return pdf.getPage(number).then(function (page) {
+			var app = ui.part && !run && readerPdfApplication();
+			if (app && app.pdfDocument === pdf) {
+				ui.part.textContent = 'Preparing page ' + number + '/' + pdf.numPages;
+			}
+			var timer;
+			var deadline = new Promise(function (_resolve, reject) {
+				timer = setTimeout(function () {
+					reject(new Error('Reading PDF page ' + number + ' timed out. Reload the reader and try again.'));
+				}, 15000);
+			});
+			var loaded = Promise.resolve().then(function () { return pdf.getPage(number); }).then(function (page) {
 				return Promise.all([
 					page.getTextContent({ includeMarkedContent: true }),
 					page.getStructTree ? page.getStructTree().catch(function () { return null; }) : null
 				]).then(function (results) {
-					pages.push(pdfPageLines(results[0], page.getViewport({ scale: 1 }), results[1]));
-					return next(number + 1);
+					return pdfPageLines(results[0], page.getViewport({ scale: 1 }), results[1]);
 				});
+			});
+			// A pending PDF.js request must not remain cached forever after Stop/retry.
+			return Promise.race([loaded, deadline]).finally(function () {
+				clearTimeout(timer);
+			}).then(function (page) {
+				pages.push(page);
+				return next(number + 1);
 			});
 		}
 		var pending = Promise.resolve().then(function () { return next(1); }).catch(function (error) {
@@ -2742,12 +3032,16 @@
 		var previous = run;
 		var key = attachmentKey();
 		var request = ++documentReadRequest;
-		var autoplay = previous.loading ? previous.autoplay : !!(audio && !audio.paused);
-		previous.loading = true;
-		previous.autoplay = autoplay;
-		previous.playRequest = {};
+		var autoplay = !previous || (previous.loading ? previous.autoplay : !!(audio && !audio.paused));
+		if (previous) {
+			previous.loading = true;
+			previous.autoplay = autoplay;
+			previous.playRequest = {};
+		}
 		if (audio) audio.pause();
+		showBar();
 		setPhase('loading');
+		setError(null);
 		fetchDocumentText().then(function (text) {
 			if (request !== documentReadRequest || run !== previous || attachmentKey() !== key) return;
 			if (!startRun('document', text, { attachmentKey: key, surfaceHit: hit, autoplay: autoplay })) {
@@ -2755,8 +3049,10 @@
 			}
 		}).catch(function (err) {
 			if (request !== documentReadRequest || run !== previous || attachmentKey() !== key) return;
-			previous.loading = false;
-			if (!audio || !audio.src) previous.failed = previous.index;
+			if (previous) {
+				previous.loading = false;
+				if (!audio || !audio.src) previous.failed = previous.index;
+			}
 			setPhase('paused');
 			setError(err && err.message ? err.message : 'Could not load full text');
 		});
@@ -2873,7 +3169,7 @@
 		var nodes = [];
 		var node;
 		while ((node = walker.nextNode())) {
-			if (!acceptsSurfaceTextNode(node, true)) continue;
+			if (!acceptsSurfaceTextNode(node, true, true)) continue;
 			var line = {
 				node: node, text: node.nodeValue,
 				block: node.parentElement.closest('p, div, li, h1, h2, h3, h4, h5, h6, section, blockquote, tr, pre')
@@ -2900,7 +3196,7 @@
 			page.lines = pdfReadingOrder(page.lines.filter(function (line) { return line.text.trim(); }), 0, page.width);
 			if (isPdfMetadataPage(page)) return;
 			var index = 0;
-			pdfBodyLines(page).forEach(function (line) {
+			page.lines.forEach(function (line) {
 				line.fragments.forEach(function (fragment) {
 					fragment = fragment.sourceFragment || fragment;
 					fragment.accepted = true;
@@ -2991,9 +3287,7 @@
 					&& !(target.closest && target.closest('.ztts-bar, #sidebarContainer, .sidebar'))) {
 					suspendSurfaceFollow();
 				}
-				window.requestAnimationFrame(function () {
-					paintHighlight(true, false);
-				});
+				scheduleSurfaceRepaint();
 			}
 		}, true);
 	}

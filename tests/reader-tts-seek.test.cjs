@@ -32,11 +32,16 @@ function surface(text) {
  };
 }
 
-function reader({ alignment = false, deferred = false, fulltextDeferred = false, storage = new Map(), config = {} } = {}) {
+function reader({ alignment = false, captions = null, deferred = false, fulltextDeferred = false, storage = new Map(), config = {}, registry } = {}) {
  const requests = [], revoked = [], clips = new Map();
  const alignmentRequests = [];
+ const captionRequests = [], playTimelines = [];
  const documentRequests = [];
+ let registryValue = registry;
+ let registryRequests = 0;
  let nextUrl = 0;
+ let elapsed = 0, nextTimer = 0;
+ const timers = new Map();
  class Audio {
   constructor() { this.listeners = {}; this.src = ''; this.paused = true; this.currentTime = 0; }
   addEventListener(type, callback) { (this.listeners[type] ||= []).push(callback); }
@@ -53,7 +58,7 @@ function reader({ alignment = false, deferred = false, fulltextDeferred = false,
     this.emit('loadedmetadata');
    });
   }
-  play() { this.paused = false; this.emit('playing'); return Promise.resolve(); }
+  play() { playTimelines.push(context.api.run?.parts[context.api.run.index].timeline); this.paused = false; this.emit('playing'); return Promise.resolve(); }
  }
  const context = {
   document: {
@@ -63,7 +68,10 @@ function reader({ alignment = false, deferred = false, fulltextDeferred = false,
    querySelector: () => null
   },
   localStorage: { getItem: key => storage.get(key), setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key) },
-  Audio, AbortController,
+  Audio, AbortController, atob,
+  Blob: class { constructor(parts, {type}) { this.text=Buffer.concat(parts.map(p=>Buffer.from(p))).toString(); this.type=type; } },
+  setTimeout: (callback, delay) => { const id = ++nextTimer; timers.set(id, { callback, at: elapsed + delay }); return id; },
+  clearTimeout: id => timers.delete(id),
   location: { pathname: '/library/items/ABCDEFGH' },
   FileReader: class {
    readAsDataURL() { this.result = 'data:audio/mpeg;base64,AAAA'; queueMicrotask(() => this.onload()); }
@@ -78,7 +86,19 @@ function reader({ alignment = false, deferred = false, fulltextDeferred = false,
     documentRequests.push(request);
     if (!fulltextDeferred) request.resolve();
    });
+   if (url === '/reader-tts-pronunciations') {
+    registryRequests++;
+    if (registryValue instanceof Error) return Promise.reject(registryValue);
+    return Promise.resolve({
+     ok: true,
+     json: async () => ({ ok: true, pronunciations: registryValue })
+    });
+   }
    const body = JSON.parse(options.body);
+   if (url.endsWith('/dev/captioned_speech')) {
+    captionRequests.push(body);
+    return Promise.resolve(captions ? {ok:true,json:async()=>captions(body)} : {ok:false,status:404});
+   }
    if (url.endsWith('/align')) {
     alignmentRequests.push(body.text);
     return Promise.resolve({
@@ -98,7 +118,7 @@ function reader({ alignment = false, deferred = false, fulltextDeferred = false,
  vm.runInNewContext(source.replace(
   '// ------------------------------------------------------------ entry point',
   `globalThis.api = {
-   startRun, stopRun, seekToSurfaceClick, seekToWord, applyVoice, nextPart, togglePlay,
+   startRun, stopRun, seekToSurfaceClick, seekToWord, applyVoice, applySpeed, previousPart, seekBy, nextPart, togglePlay,
    get run() { return run; }, get audio() { return audio; }
   }; return;`
  ), context);
@@ -114,9 +134,62 @@ function reader({ alignment = false, deferred = false, fulltextDeferred = false,
   const handled = api.seekToSurfaceClick(surface(content), event);
   return { handled, event };
  }
- return { api, click, requests, alignmentRequests, documentRequests, revoked, clips, storage,
+ return { api, click, requests, alignmentRequests, captionRequests, playTimelines, documentRequests, revoked, clips, storage,
+  advance: ms => { elapsed += ms; for (const [id, timer] of timers) if (timer.at <= elapsed) { timers.delete(id); timer.callback(); } },
+  get registryRequests() { return registryRequests; },
+  setRegistry: value => { registryValue = value; },
   start: () => api.startRun('document', text, { attachmentKey: 'ABCDEFGH' }) };
 }
+
+test('native Kokoro timings are ready before playback, including pronunciation fragments and numbers', async () => {
+ const r=reader({alignment:true,config:{chunkMaxChars:1500},captions:()=>({
+  audio:Buffer.from('audio').toString('base64'),audio_format:'audio/mpeg',
+  timestamps:['Meso','-level','costs','25','dollars','.'].map((word,i)=>({word,start_time:i*.2,end_time:(i+1)*.2}))
+ })});
+ r.api.startRun('selection','Meso-level costs 25 dollars.');
+ await settle();
+ assert.equal(r.captionRequests.length,1);
+ assert.equal(r.captionRequests[0].normalization_options.normalize,false);
+ assert.equal(r.requests.length,0,'no second synthesis');
+ assert.equal(r.alignmentRequests.length,0,'no transcription job');
+ assert.deepEqual(Array.from(r.playTimelines[0],entry=>Array.from(entry).slice(0,3)),[[0,0,400],[1,400,600],[2,600,800],[3,800,1000]]);
+ assert.equal(r.api.audio.paused,false);
+});
+
+test('unsupported captioned speech falls back to ordinary audio and alignment', async () => {
+ const r=reader({alignment:true});
+ r.api.startRun('selection','Fallback remains readable.');
+ await settle();
+ assert.equal(r.captionRequests.length,1);
+ assert.equal(r.requests.length,1);
+ assert.equal(r.alignmentRequests.length,1);
+ assert.equal(r.api.audio.paused,false);
+});
+
+test('unusable native timings reuse the generated audio for alignment', async () => {
+ for(const timestamps of [null,[{word:'different',start_time:0,end_time:1}],[{word:'Read',start_time:NaN,end_time:1}],
+  [{word:'Read',start_time:1,end_time:.5}],
+  [{word:'Read',start_time:1,end_time:2},{word:'this',start_time:0,end_time:1},{word:'sentence',start_time:2,end_time:3}]]) {
+  const r=reader({alignment:true,captions:()=>({audio:Buffer.from('audio').toString('base64'),audio_format:'audio/mpeg',timestamps})});
+  r.api.startRun('selection','Read this sentence.');
+  await settle();
+  assert.equal(r.requests.length,0,'do not synthesize again');
+  assert.equal(r.alignmentRequests.length,1,'use the existing fallback');
+  assert.equal(r.api.audio.paused,false);
+ }
+});
+
+test('native timings retain original word indexes after a jump and support subsequent seeking', async () => {
+ const r=reader({alignment:true,captions:body=>({audio:Buffer.from(body.input).toString('base64'),audio_format:'audio/mpeg',
+  timestamps:body.input.match(/\S+/g).map((word,i)=>({word,start_time:i,end_time:i+.8}))})});
+ r.start();await settle();
+ r.click('final topic');await settle();
+ assert.equal(r.api.run.parts[2].startWord,4);
+ assert.equal(r.api.run.parts[2].timeline[0][0],4);
+ assert.equal(r.alignmentRequests.length,0);
+ r.api.seekToWord(2,6);await settle();
+ assert.equal(r.api.audio.currentTime,1.92);
+});
 
 test('repairs wrapped words before chunking, synthesis and alignment for document and selection playback', async () => {
  for (const source of ['document', 'selection']) {
@@ -186,6 +259,45 @@ test('pronunciation dictionary can be customized or disabled and skips non-Engli
   await settle();
   assert.equal(r.requests[0].text, expected);
  }
+});
+
+test('remote pronunciation registry overrides the local fallback and can disable it', async () => {
+ for (const [registry, expected] of [
+  [{ meso: 'remote' }, '[Meso](/remote/)'],
+  [{}, 'Meso']
+ ]) {
+  const r = reader({
+   registry,
+   config: { pronunciationsEndpoint: '/reader-tts-pronunciations' }
+  });
+  r.api.startRun('selection', 'Meso');
+  await settle();
+  assert.equal(r.requests[0].text, expected);
+  assert.equal(r.registryRequests, 1);
+ }
+});
+
+test('remote pronunciation refresh is live and keeps the last valid dictionary on failure', async () => {
+ const r = reader({
+  registry: { meso: 'first' },
+  config: { pronunciationsEndpoint: '/reader-tts-pronunciations' }
+ });
+ r.api.startRun('selection', 'Meso');
+ await settle();
+ assert.equal(r.requests[0].text, '[Meso](/first/)');
+
+ r.setRegistry({ meso: 'second' });
+ r.api.stopRun();
+ r.api.startRun('selection', 'Meso');
+ await settle();
+ assert.equal(r.requests[1].text, '[Meso](/second/)');
+
+ r.setRegistry(new Error('offline'));
+ r.api.stopRun();
+ r.api.startRun('selection', 'Meso');
+ await settle();
+ assert.equal(r.requests[2].text, '[Meso](/second/)');
+ assert.equal(r.registryRequests, 3);
 });
 
 test('Command-click jumps to an unsynthesized later part without requiring alignment', async () => {
@@ -367,6 +479,59 @@ test('changing voice after a jump preserves its word offset', async () => {
  assert.equal(r.api.audio.currentTime, 3);
 });
 
+test('Command-click starts idle or stopped playback at the clicked word', async () => {
+ const r = reader();
+ for (let attempt = 0; attempt < 2; attempt++) {
+  const { handled, event } = r.click('final topic');
+  assert.equal(handled, true);
+  assert.equal(event.prevented, true);
+  assert.equal(event.stopped, true);
+  await settle();
+  assert.equal(r.api.run.source, 'document');
+  assert.equal(r.api.run.index, 2);
+  assert.equal(r.clips.get(r.api.audio.src), 'final topic with a memorable conclusion.');
+  assert.equal(r.api.audio.paused, false);
+  r.api.stopRun();
+ }
+});
+
+test('idle clicks ignore ordinary clicks, secondary clicks and empty space', () => {
+ const r = reader();
+ for (const overrides of [{ metaKey: false }, { button: 2 }, { clientY: 100 }]) {
+  const { handled, event } = r.click('final topic', overrides);
+  assert.equal(handled, false);
+  assert.equal(event.prevented, undefined);
+ }
+ assert.equal(r.documentRequests.length, 0);
+});
+
+test('the latest idle click wins and stopping cancels pending document loading', async () => {
+ const r = reader({ fulltextDeferred: true });
+ r.click('second topic');
+ r.click('final topic');
+ r.documentRequests[1].resolve(); await settle();
+ r.documentRequests[0].resolve(); await settle();
+ assert.equal(r.clips.get(r.api.audio.src), 'final topic with a memorable conclusion.');
+ r.api.stopRun();
+ r.click('second topic');
+ r.api.stopRun();
+ r.documentRequests[2].resolve(); await settle();
+ assert.equal(r.api.run, null);
+ assert.equal(r.api.audio.paused, true);
+ assert.equal(r.api.audio.src, '');
+});
+
+test('failed idle document loading permits a later click to retry', async () => {
+ const r = reader({ fulltextDeferred: true });
+ r.click('final topic');
+ r.documentRequests[0].reject(new Error('Document unavailable')); await settle();
+ assert.equal(r.api.run, null);
+ r.click('second topic');
+ r.documentRequests[1].resolve(); await settle();
+ assert.equal(r.api.run.index, 1);
+ assert.equal(r.api.audio.paused, false);
+});
+
 test('Command-click outside Read selection expands playback to the complete document', async () => {
  const r = reader();
  r.api.startRun('selection', paragraphs[0]); await settle();
@@ -440,4 +605,132 @@ test('a click absent from the full text does not discard the selection', async (
  r.documentRequests[0].resolve(paragraphs[0]); await settle();
  assert.equal(r.api.run.source, 'selection');
  assert.equal(r.api.run.loading, false);
+});
+
+
+test('headings wait two seconds before speech and one second after, at every playback speed', async () => {
+ for (const speed of [0.75, 1, 2]) {
+  const r = reader({ config: { chunkMaxChars: 1500 } });
+  r.api.startRun('document', 'Opening prose.\n\n## The family\nThe body follows.\n\n## A second heading\nMore body text.');
+  await settle();
+  r.api.applySpeed(speed);
+  assert.deepEqual(Array.from(r.api.run.parts, part => part.text), [
+   'Opening prose.', 'The family.', 'The body follows.', 'A second heading.', 'More body text.'
+  ]);
+  r.api.audio.paused = true;
+  r.api.audio.emit('ended');
+  await settle();
+  assert.equal(r.api.run.index, 1);
+  assert.equal(r.clips.get(r.api.audio.src), 'The family.');
+  r.advance(1999);
+  await settle();
+  assert.equal(r.api.audio.paused, true, 'heading waits two full seconds');
+  r.advance(1);
+  await settle();
+  assert.equal(r.api.audio.paused, false);
+  r.api.audio.paused = true;
+  r.api.audio.emit('ended');
+  r.advance(999);
+  await settle();
+  assert.equal(r.api.run.index, 1, 'body waits one full second after the heading');
+  r.advance(1);
+  await settle();
+  assert.equal(r.api.run.index, 2);
+  assert.equal(r.clips.get(r.api.audio.src), 'The body follows.');
+  assert.equal(r.api.audio.paused, false);
+  assert.equal(r.api.audio.playbackRate, speed);
+ }
+});
+
+test('an opening title waits two seconds and its pause can be stopped or paused', async () => {
+ const r = reader();
+ r.api.startRun('selection', '# Title\nBody follows.');
+ await settle();
+ assert.equal(r.api.audio.paused, true);
+ r.advance(1999);
+ await settle();
+ assert.equal(r.api.audio.paused, true);
+ r.api.togglePlay();
+ r.advance(5000);
+ await settle();
+ assert.equal(r.api.audio.paused, true);
+ r.api.togglePlay();
+ r.advance(2000);
+ await settle();
+ assert.equal(r.api.run.index, 0);
+ assert.equal(r.api.audio.paused, false);
+ r.api.stopRun();
+ r.advance(5000);
+ assert.equal(r.api.run, null);
+});
+
+test('pausing a heading gap prevents its timer from resuming playback', async () => {
+ const r = reader();
+ r.api.startRun('selection', '# Heading\nBody follows.');
+ await settle();
+ r.advance(2000);
+ await settle();
+ r.api.audio.paused = true;
+ r.api.audio.emit('ended');
+ r.api.togglePlay();
+ r.advance(5000);
+ await settle();
+ assert.equal(r.api.run.index, 0);
+ assert.equal(r.api.audio.paused, true);
+ r.api.togglePlay();
+ r.advance(1000);
+ await settle();
+ assert.equal(r.api.run.index, 1);
+ assert.equal(r.api.audio.paused, false);
+});
+
+test('navigation and stopping cancel the old heading pause', async () => {
+ const r = reader();
+ r.api.startRun('document', '# Heading\nBody follows.\n\n# Next heading\nFinal body.');
+ await settle();
+ r.advance(2000);
+ await settle();
+ r.api.audio.paused = true;
+ r.api.audio.emit('ended');
+ r.api.nextPart();
+ await settle();
+ assert.equal(r.api.run.index, 1);
+ assert.equal(r.api.audio.paused, false);
+ r.advance(5000);
+ await settle();
+ assert.equal(r.api.run.index, 1);
+ r.api.nextPart();
+ await settle();
+ r.advance(2000);
+ await settle();
+ r.api.audio.paused = true;
+ r.api.audio.emit('ended');
+ r.api.stopRun();
+ r.advance(5000);
+ await settle();
+ assert.equal(r.api.run, null);
+ assert.equal(r.api.audio.src, '');
+});
+
+
+test('rewinding during a heading gap cancels the timer and preserves playback intent', async () => {
+ for (const paused of [false, true]) {
+  for (const rewind of ['previousPart', 'seekBy']) {
+   const r = reader();
+   r.api.startRun('selection', '# Heading\nBody follows.');
+   await settle();
+   r.advance(2000);
+   await settle();
+   r.api.audio.currentTime = 90;
+   r.api.audio.paused = true;
+   r.api.audio.emit('ended');
+   if (paused) r.api.togglePlay();
+   r.api[rewind](-15);
+   r.api.audio.emit('seeking');
+   r.advance(5000);
+   await settle();
+   assert.equal(r.api.run.index, 0, 'rewinding must not skip the remaining heading');
+   assert.equal(r.api.audio.paused, paused);
+  }
+ }
 });
