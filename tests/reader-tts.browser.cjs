@@ -11,7 +11,9 @@ function wrappedPDF() {
  const pages = [
   [[72, 700, 'The inter'], [142, 700, '-'], [72, 680, 'viewer values well-being.'],
    [72, 660, 'They requested a re-'], [72, 640, 'a-'], [72, 620, 'lignment.'],
-   [72, 600, 'The final word is inter-']],
+   [72, 600, 'Evidence (Brohan et al. 2010) supports this.'],
+   [72, 580, 'According to Corrigan and Shapiro (2010), evidence matters.'],
+   [72, 560, 'The final word is inter-']],
   [[72, 700, 'viewer.'], [72, 680, 'The rest remains readable.']]
  ];
  const objects = ['<< /Type /Catalog /Pages 2 0 R >>',
@@ -67,7 +69,7 @@ after(async () => { await browser?.close(); });
 
 test('real PDF extraction joins words across lines and pages before speech', async () => {
  const text = await page.evaluate(async () => tts.normalizeForSpeech(await tts.fetchPdfDocumentText(PDFViewerApplication.pdfDocument)));
- assert.equal(text, 'The interviewer values well-being. They requested a realignment. The final word is interviewer. The rest remains readable.');
+ assert.equal(text, 'The interviewer values well-being. They requested a realignment. Evidence citation supports this. According to citation, evidence matters. The final word is interviewer. The rest remains readable.');
 });
 
 test('real PDF selection and highlight ranges follow the repaired words', async () => {
@@ -85,7 +87,7 @@ test('real PDF selection and highlight ranges follow the repaired words', async 
   });
   return { text, joined };
  });
- assert.equal(result.text, 'The interviewer values well-being. They requested a realignment. The final word is inter-');
+ assert.equal(result.text, 'The interviewer values well-being. They requested a realignment. Evidence citation supports this. According to citation, evidence matters. The final word is inter-');
  assert.equal(result.joined[0]?.word, 'interviewer');
  assert.equal(result.joined[1]?.word, 'realignment');
  assert.ok(result.joined.every(token => token.rects >= 3), 'each repaired word highlights all three printed fragments');
