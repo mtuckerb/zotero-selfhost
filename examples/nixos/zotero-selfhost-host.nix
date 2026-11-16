@@ -28,7 +28,7 @@
     infrastructure = {
       enable = true;
       hostname = "zotero.tuckerbradford.com";
-      attachmentsHostname = "attachments.zotero.tuckerbradford.com";
+      attachmentsHostname = "attachments-zotero.tuckerbradford.com";
       enableACME = true;
       forceSSL = true;
       openFirewall = true;

@@ -1317,7 +1317,7 @@ in {
 
       attachmentsHostname = mkOption {
         type = types.str;
-        default = "attachments.zotero.tuckerbradford.com";
+        default = "attachments-zotero.tuckerbradford.com";
         description = "Public hostname that reverse proxies MinIO for attachment download URLs.";
       };
 

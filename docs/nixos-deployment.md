@@ -19,7 +19,7 @@ When `services.zotero-selfhost.enable = true;` and `services.zotero-selfhost.inf
 Default public hostnames are:
 
 - `zotero.tuckerbradford.com`
-- `attachments.zotero.tuckerbradford.com`
+- `attachments-zotero.tuckerbradford.com`
 
 Override them in your NixOS config if needed.
 
